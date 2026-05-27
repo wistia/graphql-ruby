@@ -26,11 +26,14 @@ module GraphQL
       end
       private_class_method :fingerprints_for
 
+      def self.clear_cache
+        FINGERPRINT_CACHE.clear
+      end
+
       def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, **json_options)
         FileUtils.mkdir_p(cache_dir)
 
         fingerprints = fingerprints_for(schema)
-        types = fingerprints.keys
         options_key = Digest::SHA256.hexdigest(json_options.sort.map(&:inspect).join)
         merkle_root = Digest::SHA256.hexdigest(
           fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join
@@ -38,7 +41,7 @@ module GraphQL
 
         cache_path = File.join(cache_dir, "schema_#{merkle_root}_#{options_key}.json")
         begin
-          return File.read(cache_path, binmode: true)
+          return File.read(cache_path, encoding: Encoding::UTF_8)
         rescue Errno::ENOENT
           nil
         end
@@ -62,7 +65,7 @@ module GraphQL
 
         full_cache_path = File.join(cache_dir, "schema_#{merkle_root}.graphql")
         begin
-          return File.read(full_cache_path, binmode: true)
+          return File.read(full_cache_path, encoding: Encoding::UTF_8)
         rescue Errno::ENOENT
           nil
         end
@@ -235,7 +238,7 @@ module GraphQL
       def self.fragment_for_node(node, type_name, fingerprint, printer, cache_dir)
         frag_path = File.join(cache_dir, "types", "#{type_name}_#{fingerprint}.sdl")
         begin
-          return File.read(frag_path, binmode: true)
+          return File.read(frag_path, encoding: Encoding::UTF_8)
         rescue Errno::ENOENT
           nil
         end

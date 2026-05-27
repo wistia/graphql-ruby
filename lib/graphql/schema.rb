@@ -13,6 +13,7 @@ require "graphql/schema/type_expression"
 require "graphql/schema/unique_within_type"
 require "graphql/schema/warden"
 require "graphql/schema/build_from_definition"
+require "graphql/schema/cached_dump"
 
 require "graphql/schema/validator"
 require "graphql/schema/member"

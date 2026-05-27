@@ -42,7 +42,8 @@ module GraphQL
       include_schema_description: false,
       include_is_repeatable: false,
       include_specified_by_url: false,
-      include_is_one_of: false
+      include_is_one_of: false,
+      cache_dir: nil
     }
 
     # @return [String] Namespace for generated tasks
@@ -78,6 +79,11 @@ module GraphQL
     # @see GraphQL::Schema.as_json
     attr_accessor :include_deprecated_args, :include_schema_description, :include_is_repeatable, :include_specified_by_url, :include_is_one_of
 
+    # @return [String, nil] Directory for the Merkle-tree SDL fragment cache.
+    #   When set, {GraphQL::Schema::CachedDump} is used for IDL dumps.
+    #   Warm runs (nothing changed) skip all schema processing and return the cached SDL.
+    attr_accessor :cache_dir
+
     # Set the parameters of this task by passing keyword arguments
     # or assigning attributes inside the block
     def initialize(options = {})
@@ -102,16 +108,24 @@ module GraphQL
       context = @load_context.call(self)
       result = case method_name
       when :to_json
-        schema.to_json(
+        json_options = {
           include_is_one_of: include_is_one_of,
           include_deprecated_args: include_deprecated_args,
           include_is_repeatable: include_is_repeatable,
           include_specified_by_url: include_specified_by_url,
           include_schema_description: include_schema_description,
-          context: context
-        )
+        }
+        if @cache_dir
+          GraphQL::Schema::CachedDump.dump_json(schema, context: context, cache_dir: @cache_dir, **json_options)
+        else
+          schema.to_json(context: context, **json_options)
+        end
       when :to_definition
-        schema.to_definition(context: context)
+        if @cache_dir
+          GraphQL::Schema::CachedDump.dump(schema, context: context, cache_dir: @cache_dir)
+        else
+          schema.to_definition(context: context)
+        end
       else
         raise ArgumentError, "Unexpected schema dump method: #{method_name.inspect}"
       end

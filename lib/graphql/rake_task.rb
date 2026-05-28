@@ -45,7 +45,7 @@ module GraphQL
       include_specified_by_url: false,
       include_is_one_of: false,
       cache_dir: nil,
-      parallel_workers: [Etc.nprocessors, 8].min
+      parallel_workers: nil
     }
 
     # @return [String] Namespace for generated tasks
@@ -98,6 +98,8 @@ module GraphQL
         self.public_send("#{k}=", v)
       end
 
+      @parallel_workers ||= [Etc.nprocessors, 8].min
+
       if block_given?
         yield(self)
       end
@@ -122,13 +124,13 @@ module GraphQL
           include_schema_description: include_schema_description,
         }
         if @cache_dir
-          GraphQL::Schema::CachedDump.dump_json(schema, context: context, cache_dir: @cache_dir, num_workers: @parallel_workers, **json_options)
+          GraphQL::Schema::CachedDump.dump_json(schema, context: context, cache_dir: @cache_dir, parallel_workers: @parallel_workers, **json_options)
         else
           schema.to_json(context: context, **json_options)
         end
       when :to_definition
         if @cache_dir
-          GraphQL::Schema::CachedDump.dump(schema, context: context, cache_dir: @cache_dir, num_workers: @parallel_workers)
+          GraphQL::Schema::CachedDump.dump(schema, context: context, cache_dir: @cache_dir, parallel_workers: @parallel_workers)
         else
           schema.to_definition(context: context, parallel_workers: @parallel_workers)
         end

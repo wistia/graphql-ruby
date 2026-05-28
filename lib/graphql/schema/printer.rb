@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 require "etc"
 require "securerandom"
+require "tmpdir"
 
 module GraphQL
   class Schema
@@ -143,7 +144,8 @@ module GraphQL
       end
 
       # Fork +num_workers+ processes to render slices of +nodes+.
-      # Each worker sends back a Hash[index => rendered_string] via a pipe.
+      # Each worker writes its marshaled result to a temp file and sends the path
+      # through the pipe (a short string that never overflows the 64KB pipe buffer).
       # Returns a Hash[index => rendered_string] covering all nodes.
       def fork_render_nodes(nodes, num_workers)
         actual_workers = [num_workers, nodes.size].min
@@ -157,28 +159,40 @@ module GraphQL
 
         workers = batches.map do |batch|
           rd, wr = IO.pipe
-          pid = fork do
-            rd.close
-            lang_printer = GraphQL::Language::Printer.new
-            batch_result = {}
-            batch.each do |idx, node|
-              batch_result[idx] = lang_printer.print(node)
+          pid = begin
+            fork do
+              rd.close
+              begin
+                lang_printer = GraphQL::Language::Printer.new
+                batch_result = {}
+                batch.each do |idx, node|
+                  batch_result[idx] = lang_printer.print(node)
+                end
+                tmp_result = File.join(Dir.tmpdir, "printer_render.#{Process.pid}.#{SecureRandom.hex(8)}")
+                File.binwrite(tmp_result, Marshal.dump(batch_result))
+                wr.write(tmp_result)
+              ensure
+                wr.close
+                exit!(0)
+              end
             end
-            wr.write(Marshal.dump(batch_result))
+          rescue
             wr.close
-            exit!(0)
+            raise
           end
           wr.close
           { pid: pid, rd: rd }
         end
 
         workers.each do |w|
-          raw = w[:rd].read
+          tmp_path = w[:rd].read
           w[:rd].close
-          Marshal.load(raw).each { |idx, sdl| results[idx] = sdl }
-          _pid, status = Process.waitpid2(w[:pid])
-          unless status.success?
-            raise "Schema::Printer render worker (pid #{w[:pid]}) failed with status #{status.exitstatus}"
+          begin
+            Marshal.load(File.binread(tmp_path)).each { |idx, sdl| results[idx] = sdl }
+          ensure
+            File.unlink(tmp_path) rescue nil
+            _pid, status = Process.waitpid2(w[:pid])
+            raise "Schema::Printer render worker (pid #{w[:pid]}) failed with status #{status.exitstatus}" unless status.success?
           end
         end
 

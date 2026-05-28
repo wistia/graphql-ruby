@@ -858,4 +858,77 @@ RSpec.describe GraphQL::Schema::CachedDump do
       end
     end
   end
+
+  # ---------------------------------------------------------------------------
+  # 8. Parallel execution
+  # ---------------------------------------------------------------------------
+  let(:large_schema) do
+    types = (1..25).map do |i|
+      Class.new(GraphQL::Schema::Object) do
+        graphql_name "Type#{i}"
+        field :id, GraphQL::Types::ID, null: false
+        field :name, String, null: true
+      end
+    end
+    query_type = Class.new(GraphQL::Schema::Object) do
+      graphql_name "Query"
+      types.each_with_index do |t, i|
+        field :"type#{i}", t, null: true
+      end
+    end
+    Class.new(GraphQL::Schema) { query query_type }
+  end
+
+  describe "parallel execution" do
+    it "parallel dump output matches serial dump output" do
+      Dir.mktmpdir do |dir|
+        serial = described_class.dump(large_schema, cache_dir: dir, parallel_workers: 1)
+        fp_cache.clear
+        FileUtils.rm_rf(dir); FileUtils.mkdir_p(dir)
+        parallel = described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
+        expect(parallel).to eq(serial)
+      end
+    end
+
+    it "parallel dump_json output matches serial dump_json output" do
+      Dir.mktmpdir do |dir|
+        serial = described_class.dump_json(large_schema, cache_dir: dir, parallel_workers: 1)
+        fp_cache.clear
+        parallel = described_class.dump_json(large_schema, cache_dir: dir, parallel_workers: 4)
+        expect(JSON.parse(parallel)).to eq(JSON.parse(serial))
+      end
+    end
+
+    it "parallel dump matches to_definition" do
+      Dir.mktmpdir do |dir|
+        result = described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
+        expect(result).to eq(large_schema.to_definition)
+      end
+    end
+
+    it "parallel warm run (full cache hit) still returns correct output" do
+      Dir.mktmpdir do |dir|
+        described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
+        fp_cache.clear
+        result = described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
+        expect(result).to eq(large_schema.to_definition)
+      end
+    end
+
+    it "all fragment files are created with parallel workers" do
+      Dir.mktmpdir do |dir|
+        described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
+        sdl_files = Dir.glob("#{dir}/types/*.sdl")
+        expect(sdl_files.length).to be >= 25
+      end
+    end
+  end
+
+  describe "Schema::Printer parallel output" do
+    it "parallel_workers output matches serial output" do
+      serial = large_schema.to_definition(parallel_workers: 1)
+      parallel = large_schema.to_definition(parallel_workers: 4)
+      expect(parallel).to eq(serial)
+    end
+  end
 end

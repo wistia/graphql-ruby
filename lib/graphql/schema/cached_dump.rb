@@ -3,6 +3,7 @@ require "digest/sha2"
 require "etc"
 require "fileutils"
 require "securerandom"
+require "tmpdir"
 
 module GraphQL
   class Schema
@@ -27,8 +28,8 @@ module GraphQL
       FINGERPRINT_CACHE = {}.compare_by_identity
       private_constant :FINGERPRINT_CACHE
 
-      def self.fingerprints_for(schema, num_workers: 1)
-        FINGERPRINT_CACHE[schema] ||= compute_fingerprints(dumpable_types(schema), num_workers: num_workers)
+      def self.fingerprints_for(schema, parallel_workers: 1)
+        FINGERPRINT_CACHE[schema] ||= compute_fingerprints(dumpable_types(schema), parallel_workers: parallel_workers)
       end
       private_class_method :fingerprints_for
 
@@ -36,10 +37,10 @@ module GraphQL
         FINGERPRINT_CACHE.clear
       end
 
-      def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, num_workers: [Etc.nprocessors, 8].min, **json_options)
+      def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, **json_options)
         FileUtils.mkdir_p(cache_dir)
 
-        fingerprints = fingerprints_for(schema, num_workers: num_workers)
+        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers)
         options_key = Digest::SHA256.hexdigest(json_options.sort.map(&:inspect).join)
         merkle_root = Digest::SHA256.hexdigest(
           fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join
@@ -60,10 +61,10 @@ module GraphQL
         result
       end
 
-      def self.dump(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, num_workers: [Etc.nprocessors, 8].min)
+      def self.dump(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min)
         FileUtils.mkdir_p(File.join(cache_dir, "types"))
 
-        fingerprints = fingerprints_for(schema, num_workers: num_workers)
+        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers)
         types = fingerprints.keys
         merkle_root = Digest::SHA256.hexdigest(
           fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join
@@ -119,8 +120,8 @@ module GraphQL
         end
 
         # Render cache misses — parallel if there are enough of them.
-        if misses.size >= RENDER_FORK_THRESHOLD && num_workers > 1
-          rendered_misses = parallel_render_fragments(misses, cache_dir, num_workers)
+        if misses.size >= RENDER_FORK_THRESHOLD && parallel_workers > 1
+          rendered_misses = parallel_render_fragments(misses, cache_dir, parallel_workers)
         else
           rendered_misses = {}
           misses.each do |idx, node, _type_name, _fp|
@@ -167,9 +168,9 @@ module GraphQL
 
       # Compute fingerprints, optionally in parallel.
       # Returns a Hash[type => hex_digest].
-      def self.compute_fingerprints(types, num_workers: 1)
-        if num_workers > 1 && types.size >= FINGERPRINT_FORK_THRESHOLD
-          parallel_fingerprints(types, num_workers)
+      def self.compute_fingerprints(types, parallel_workers: 1)
+        if parallel_workers > 1 && types.size >= FINGERPRINT_FORK_THRESHOLD
+          parallel_fingerprints(types, parallel_workers)
         else
           types.each_with_object({}) { |type, h| h[type] = type_fingerprint(type) }
         end
@@ -177,7 +178,8 @@ module GraphQL
       private_class_method :compute_fingerprints
 
       # Fork N workers to compute fingerprints in parallel.
-      # Each worker sends back a Hash[graphql_name => hex_digest] via a pipe.
+      # Each worker writes its marshaled result to a temp file and sends the path
+      # through the pipe (a short string that never overflows the 64KB pipe buffer).
       # Parent reassembles the full Hash[type => hex_digest].
       def self.parallel_fingerprints(types, num_workers)
         batches = partition_into_batches(types, num_workers)
@@ -185,25 +187,37 @@ module GraphQL
 
         workers = batches.map do |batch|
           rd, wr = IO.pipe
-          pid = fork do
-            rd.close
-            result = {}
-            batch.each { |t| result[t.graphql_name] = type_fingerprint(t) }
-            wr.write(Marshal.dump(result))
+          pid = begin
+            fork do
+              rd.close
+              begin
+                result = {}
+                batch.each { |t| result[t.graphql_name] = type_fingerprint(t) }
+                tmp_result = File.join(Dir.tmpdir, "cached_dump_fp.#{Process.pid}.#{SecureRandom.hex(8)}")
+                File.binwrite(tmp_result, Marshal.dump(result))
+                wr.write(tmp_result)
+              ensure
+                wr.close
+                exit!(0)
+              end
+            end
+          rescue
             wr.close
-            exit!(0)
+            raise
           end
           wr.close
           { pid: pid, rd: rd }
         end
 
         workers.each do |w|
-          raw = w[:rd].read
+          tmp_path = w[:rd].read
           w[:rd].close
-          Marshal.load(raw).each { |name, fp| results_by_name[name] = fp }
-          _pid, status = Process.waitpid2(w[:pid])
-          unless status.success?
-            raise "CachedDump fingerprint worker (pid #{w[:pid]}) failed with status #{status.exitstatus}"
+          begin
+            Marshal.load(File.binread(tmp_path)).each { |name, fp| results_by_name[name] = fp }
+          ensure
+            File.unlink(tmp_path) rescue nil
+            _pid, status = Process.waitpid2(w[:pid])
+            raise "CachedDump fingerprint worker (pid #{w[:pid]}) failed with status #{status.exitstatus}" unless status.success?
           end
         end
 
@@ -225,38 +239,50 @@ module GraphQL
 
         workers = batches.map do |batch|
           rd, wr = IO.pipe
-          pid = fork do
-            rd.close
-            lang_printer = GraphQL::Language::Printer.new
-            batch_result = {}
-            batch.each do |idx, node, type_name, fp|
-              frag_path = File.join(cache_dir, "types", "#{type_name}_#{fp}.sdl")
-              # Another process may have already written this fragment — check first.
+          pid = begin
+            fork do
+              rd.close
               begin
-                sdl = File.read(frag_path, encoding: Encoding::UTF_8)
-              rescue Errno::ENOENT
-                sdl = lang_printer.print(node)
-                tmp = "#{frag_path}.#{Process.pid}.#{SecureRandom.hex(8)}"
-                File.binwrite(tmp, sdl)
-                File.rename(tmp, frag_path)
+                lang_printer = GraphQL::Language::Printer.new
+                batch_result = {}
+                batch.each do |idx, node, type_name, fp|
+                  frag_path = File.join(cache_dir, "types", "#{type_name}_#{fp}.sdl")
+                  # Another process may have already written this fragment — check first.
+                  begin
+                    sdl = File.read(frag_path, encoding: Encoding::UTF_8)
+                  rescue Errno::ENOENT
+                    sdl = lang_printer.print(node)
+                    tmp = "#{frag_path}.#{Process.pid}.#{SecureRandom.hex(8)}"
+                    File.binwrite(tmp, sdl)
+                    File.rename(tmp, frag_path)
+                  end
+                  batch_result[idx] = sdl
+                end
+                tmp_result = File.join(Dir.tmpdir, "cached_dump_render.#{Process.pid}.#{SecureRandom.hex(8)}")
+                File.binwrite(tmp_result, Marshal.dump(batch_result))
+                wr.write(tmp_result)
+              ensure
+                wr.close
+                exit!(0)
               end
-              batch_result[idx] = sdl
             end
-            wr.write(Marshal.dump(batch_result))
+          rescue
             wr.close
-            exit!(0)
+            raise
           end
           wr.close
           { pid: pid, rd: rd }
         end
 
         workers.each do |w|
-          raw = w[:rd].read
+          tmp_path = w[:rd].read
           w[:rd].close
-          Marshal.load(raw).each { |idx, sdl| results[idx] = sdl }
-          _pid, status = Process.waitpid2(w[:pid])
-          unless status.success?
-            raise "CachedDump render worker (pid #{w[:pid]}) failed with status #{status.exitstatus}"
+          begin
+            Marshal.load(File.binread(tmp_path)).each { |idx, sdl| results[idx] = sdl }
+          ensure
+            File.unlink(tmp_path) rescue nil
+            _pid, status = Process.waitpid2(w[:pid])
+            raise "CachedDump render worker (pid #{w[:pid]}) failed with status #{status.exitstatus}" unless status.success?
           end
         end
 

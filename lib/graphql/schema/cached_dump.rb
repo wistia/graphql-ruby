@@ -318,6 +318,21 @@ module GraphQL
       end
       private_class_method :hash_directives
 
+      # Return a stable string for a raw type expression ivar (@return_type_expr / @type_expr).
+      # When the ivar holds a Class/Module (already resolved), use .graphql_name which is stable
+      # across processes. When it holds a String/Symbol/Array (unresolved expr), .to_s is fine.
+      def self.stable_type_expr(expr)
+        case expr
+        when Module
+          expr.respond_to?(:graphql_name) ? expr.graphql_name : expr.name.to_s
+        when Array
+          expr.map { |e| stable_type_expr(e) }.inspect
+        else
+          expr.to_s
+        end
+      end
+      private_class_method :stable_type_expr
+
       def self.type_fingerprint(type)
         d = Digest::SHA256.new
         d << type.graphql_name
@@ -336,8 +351,9 @@ module GraphQL
             field.ensure_loaded
             d << field.name
             d << "\x00"
-            # Read raw type expr directly — avoids calling field.type which triggers ensure_loaded
-            d << field.instance_variable_get(:@return_type_expr).to_s
+            # Read raw type expr directly — avoids calling field.type which triggers ensure_loaded.
+            # Use stable_type_expr to handle already-resolved Class objects (avoid #<Class:0xADDR>).
+            d << stable_type_expr(field.instance_variable_get(:@return_type_expr))
             d << "\x00"
             d << field.instance_variable_get(:@return_type_null).inspect
             d << "\x00"
@@ -351,7 +367,7 @@ module GraphQL
             field.all_argument_definitions.sort_by(&:name).each do |arg|
               d << arg.name
               d << "\x00"
-              d << arg.instance_variable_get(:@type_expr).to_s
+              d << stable_type_expr(arg.instance_variable_get(:@type_expr))
               d << "\x00"
               d << arg.instance_variable_get(:@null).inspect
               d << "\x00"
@@ -393,7 +409,7 @@ module GraphQL
           type.all_argument_definitions.sort_by(&:name).each do |arg|
             d << arg.name
             d << "\x00"
-            d << arg.instance_variable_get(:@type_expr).to_s
+            d << stable_type_expr(arg.instance_variable_get(:@type_expr))
             d << "\x00"
             d << arg.instance_variable_get(:@null).inspect
             d << "\x00"

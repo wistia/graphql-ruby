@@ -860,7 +860,77 @@ RSpec.describe GraphQL::Schema::CachedDump do
   end
 
   # ---------------------------------------------------------------------------
-  # 8. Parallel execution
+  # 8. Persisted fingerprints (watch_dirs:)
+  # ---------------------------------------------------------------------------
+  describe "persisted fingerprints (watch_dirs:)" do
+    let(:watch_dir) do
+      dir = Dir.mktmpdir
+      File.write(File.join(dir, "types.rb"), "# schema source")
+      dir
+    end
+
+    after { FileUtils.rm_rf(watch_dir) }
+
+    it "persists fingerprint file on cold run" do
+      Dir.mktmpdir do |cache_dir|
+        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        fp_files = Dir.glob("#{cache_dir}/fingerprints_*.marshal")
+        expect(fp_files.length).to eq(1)
+        expect(File.basename(fp_files.first)).to match(/\Afingerprints_[0-9a-f]{64}\.marshal\z/)
+      end
+    end
+
+    it "loads from disk on warm run (skips recomputation)" do
+      Dir.mktmpdir do |cache_dir|
+        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        fp_cache.clear
+
+        # Second call should load from disk
+        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+
+        # Still only one fingerprint file (same source hash)
+        expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal").length).to eq(1)
+      end
+    end
+
+    it "produces correct output when fingerprints are loaded from disk" do
+      Dir.mktmpdir do |cache_dir|
+        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        fp_cache.clear
+
+        # Wipe SDL cache so it re-renders from persisted fingerprints
+        Dir.glob("#{cache_dir}/schema_*.graphql").each { |f| File.delete(f) }
+
+        result = described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        expect(result).to eq(test_schema.to_definition)
+      end
+    end
+
+    it "creates new fingerprint file when watched file changes" do
+      Dir.mktmpdir do |cache_dir|
+        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        fp_cache.clear
+
+        # Modify the watched file
+        File.write(File.join(watch_dir, "types.rb"), "# changed source")
+
+        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+
+        # Two fingerprint files now (old and new source hash)
+        expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal").length).to eq(2)
+      end
+    end
+
+    it "does not create fingerprint files when watch_dirs is nil" do
+      Dir.mktmpdir do |cache_dir|
+        described_class.dump(test_schema, cache_dir: cache_dir)
+        expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal")).to be_empty
+      end
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # 9. Parallel execution
   # ---------------------------------------------------------------------------
   let(:large_schema) do
     types = (1..25).map do |i|

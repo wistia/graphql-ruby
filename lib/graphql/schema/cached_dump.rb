@@ -28,19 +28,79 @@ module GraphQL
       FINGERPRINT_CACHE = {}.compare_by_identity
       private_constant :FINGERPRINT_CACHE
 
-      def self.fingerprints_for(schema, parallel_workers: 1)
-        FINGERPRINT_CACHE[schema] ||= compute_fingerprints(dumpable_types(schema), parallel_workers: parallel_workers)
+      def self.fingerprints_for(schema, parallel_workers: 1, cache_dir: DEFAULT_CACHE_DIR, watch_dirs: nil)
+        FINGERPRINT_CACHE[schema] ||= compute_and_persist_fingerprints(schema,
+          parallel_workers: parallel_workers,
+          cache_dir: cache_dir,
+          watch_dirs: watch_dirs
+        )
       end
       private_class_method :fingerprints_for
+
+      def self.compute_and_persist_fingerprints(schema, parallel_workers:, cache_dir:, watch_dirs:)
+        sh = nil
+
+        # Try loading persisted fingerprints from disk (skips ensure_loaded entirely)
+        if watch_dirs && !watch_dirs.empty?
+          sh = source_hash(watch_dirs)
+          fprint_path = File.join(cache_dir, "fingerprints_#{sh}.marshal")
+          begin
+            persisted = Marshal.load(File.binread(fprint_path))
+            types = dumpable_types(schema)
+            if persisted.size == types.size
+              type_by_name = types.each_with_object({}) { |t, h| h[t.graphql_name] = t }
+              fps = persisted.each_with_object({}) { |(name, fp), h|
+                t = type_by_name[name]
+                h[t] = fp if t
+              }
+              return fps if fps.size == types.size
+            end
+          rescue Errno::ENOENT, TypeError, ArgumentError
+            # Cache miss or corrupt file — fall through to compute
+          end
+        end
+
+        # Full computation (pays ensure_loaded cost)
+        fps = compute_fingerprints(dumpable_types(schema), parallel_workers: parallel_workers)
+
+        # Persist to disk for future runs
+        if watch_dirs && !watch_dirs.empty?
+          sh ||= source_hash(watch_dirs)
+          fprint_path = File.join(cache_dir, "fingerprints_#{sh}.marshal")
+          by_name = fps.each_with_object({}) { |(t, fp), h| h[t.graphql_name] = fp }
+          tmp = "#{fprint_path}.#{Process.pid}.#{SecureRandom.hex(8)}"
+          File.binwrite(tmp, Marshal.dump(by_name))
+          File.rename(tmp, fprint_path)
+        end
+
+        fps
+      end
+      private_class_method :compute_and_persist_fingerprints
 
       def self.clear_cache
         FINGERPRINT_CACHE.clear
       end
 
-      def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, **json_options)
+      # Compute a SHA256 of all .rb file contents under the given directories.
+      # Used as a stable cache key for persisted fingerprints that survives git checkouts
+      # (which reset mtimes to the current time, making mtime-based keys unreliable in CI).
+      def self.source_hash(watch_dirs)
+        d = Digest::SHA256.new
+        watch_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb").sort }.each do |path|
+          d << path << "\x00"
+          d << File.binread(path)
+          d << "\x00"
+        rescue Errno::ENOENT
+          next
+        end
+        d.hexdigest
+      end
+      private_class_method :source_hash
+
+      def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, watch_dirs: nil, **json_options)
         FileUtils.mkdir_p(cache_dir)
 
-        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers)
+        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs)
         options_key = Digest::SHA256.hexdigest(json_options.sort.map(&:inspect).join)
         merkle_root = Digest::SHA256.hexdigest(
           fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join
@@ -61,10 +121,10 @@ module GraphQL
         result
       end
 
-      def self.dump(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min)
+      def self.dump(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, watch_dirs: nil)
         FileUtils.mkdir_p(File.join(cache_dir, "types"))
 
-        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers)
+        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs)
         types = fingerprints.keys
         merkle_root = Digest::SHA256.hexdigest(
           fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join

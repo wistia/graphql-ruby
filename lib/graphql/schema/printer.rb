@@ -1,4 +1,7 @@
 # frozen_string_literal: true
+require "etc"
+require "securerandom"
+
 module GraphQL
   class Schema
     # Used to convert your {GraphQL::Schema} to a GraphQL schema string
@@ -37,7 +40,10 @@ module GraphQL
       # @param schema [GraphQL::Schema]
       # @param context [Hash]
       # @param introspection [Boolean] Should include the introspection types in the string?
-      def initialize(schema, context: nil, introspection: false)
+      # @param parallel_workers [Integer] Number of fork workers for rendering type nodes.
+      #   When > 1 and there are enough type nodes, rendering is parallelized via fork+pipe.
+      #   Defaults to 1 (serial).
+      def initialize(schema, context: nil, introspection: false, parallel_workers: 1)
         @document_from_schema = GraphQL::Language::DocumentFromSchemaDefinition.new(
           schema,
           context: context,
@@ -46,6 +52,7 @@ module GraphQL
 
         @document = @document_from_schema.document
         @schema = schema
+        @parallel_workers = parallel_workers
       end
 
       # Return the GraphQL schema string for the introspection type system
@@ -84,9 +91,15 @@ module GraphQL
         printer.print_schema
       end
 
-      # Return a GraphQL schema string for the defined types in the schema
+      # Return a GraphQL schema string for the defined types in the schema.
+      # When @parallel_workers > 1, type definition nodes are rendered in forked workers.
       def print_schema
-        print(@document) + "\n"
+        workers = @parallel_workers || 1
+        if workers > 1
+          parallel_print_schema(workers)
+        else
+          print(@document) + "\n"
+        end
       end
 
       def print_type(type)
@@ -98,6 +111,78 @@ module GraphQL
         def print_schema_definition(schema)
           print_string("schema {\n  query: Root\n}")
         end
+      end
+
+      private
+
+      # Minimum number of type nodes before we bother forking render workers.
+      PARALLEL_TYPE_THRESHOLD = 4
+
+      # Render the document in parallel: header nodes serially in the parent,
+      # type definition nodes distributed across fork workers.
+      def parallel_print_schema(num_workers)
+        header_nodes, type_nodes = @document.definitions.partition do |node|
+          !node.is_a?(GraphQL::Language::Nodes::AbstractNode) ||
+            node.class.name !~ /TypeDefinition$/
+        end
+
+        # Render header nodes (schema def, directives) serially — they're cheap.
+        header_parts = header_nodes.map { |n| print(n) }
+
+        if type_nodes.size < PARALLEL_TYPE_THRESHOLD || num_workers <= 1
+          # Not worth forking — render serially.
+          type_parts_by_index = type_nodes.each_with_index.map { |n, i| [i, print(n)] }.to_h
+        else
+          type_parts_by_index = fork_render_nodes(type_nodes, num_workers)
+        end
+
+        type_parts = type_nodes.each_index.map { |i| type_parts_by_index[i] }
+
+        parts = header_parts + type_parts
+        parts.join("\n\n") + "\n"
+      end
+
+      # Fork +num_workers+ processes to render slices of +nodes+.
+      # Each worker sends back a Hash[index => rendered_string] via a pipe.
+      # Returns a Hash[index => rendered_string] covering all nodes.
+      def fork_render_nodes(nodes, num_workers)
+        actual_workers = [num_workers, nodes.size].min
+        slice_size = (nodes.size.to_f / actual_workers).ceil
+
+        # Build index-tagged batches: [[idx, node], ...]
+        indexed = nodes.each_with_index.map { |n, i| [i, n] }
+        batches = indexed.each_slice(slice_size).to_a
+
+        results = {}
+
+        workers = batches.map do |batch|
+          rd, wr = IO.pipe
+          pid = fork do
+            rd.close
+            lang_printer = GraphQL::Language::Printer.new
+            batch_result = {}
+            batch.each do |idx, node|
+              batch_result[idx] = lang_printer.print(node)
+            end
+            wr.write(Marshal.dump(batch_result))
+            wr.close
+            exit!(0)
+          end
+          wr.close
+          { pid: pid, rd: rd }
+        end
+
+        workers.each do |w|
+          raw = w[:rd].read
+          w[:rd].close
+          Marshal.load(raw).each { |idx, sdl| results[idx] = sdl }
+          _pid, status = Process.waitpid2(w[:pid])
+          unless status.success?
+            raise "Schema::Printer render worker (pid #{w[:pid]}) failed with status #{status.exitstatus}"
+          end
+        end
+
+        results
       end
     end
   end

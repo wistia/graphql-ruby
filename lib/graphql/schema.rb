@@ -281,9 +281,11 @@ module GraphQL
 
       # Return the GraphQL IDL for the schema
       # @param context [Hash]
+      # @param parallel_workers [Integer] Number of fork workers for rendering type nodes.
+      #   When > 1, rendering is parallelized via fork+pipe. Defaults to 1 (serial).
       # @return [String]
-      def to_definition(context: {})
-        GraphQL::Schema::Printer.print_schema(self, context: context)
+      def to_definition(context: {}, parallel_workers: 1)
+        GraphQL::Schema::Printer.print_schema(self, context: context, parallel_workers: parallel_workers)
       end
 
       # Return the GraphQL::Language::Document IDL AST for the schema

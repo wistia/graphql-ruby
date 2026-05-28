@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+require "etc"
 require "fileutils"
 require "rake"
 require "graphql/rake_task/validate"
@@ -43,7 +44,8 @@ module GraphQL
       include_is_repeatable: false,
       include_specified_by_url: false,
       include_is_one_of: false,
-      cache_dir: nil
+      cache_dir: nil,
+      parallel_workers: [Etc.nprocessors, 8].min
     }
 
     # @return [String] Namespace for generated tasks
@@ -84,6 +86,10 @@ module GraphQL
     #   Warm runs (nothing changed) skip all schema processing and return the cached SDL.
     attr_accessor :cache_dir
 
+    # @return [Integer] Number of fork workers used for parallel schema rendering.
+    #   Defaults to min(Etc.nprocessors, 8). Set to 1 to disable parallelism.
+    attr_accessor :parallel_workers
+
     # Set the parameters of this task by passing keyword arguments
     # or assigning attributes inside the block
     def initialize(options = {})
@@ -116,15 +122,15 @@ module GraphQL
           include_schema_description: include_schema_description,
         }
         if @cache_dir
-          GraphQL::Schema::CachedDump.dump_json(schema, context: context, cache_dir: @cache_dir, **json_options)
+          GraphQL::Schema::CachedDump.dump_json(schema, context: context, cache_dir: @cache_dir, num_workers: @parallel_workers, **json_options)
         else
           schema.to_json(context: context, **json_options)
         end
       when :to_definition
         if @cache_dir
-          GraphQL::Schema::CachedDump.dump(schema, context: context, cache_dir: @cache_dir)
+          GraphQL::Schema::CachedDump.dump(schema, context: context, cache_dir: @cache_dir, num_workers: @parallel_workers)
         else
-          schema.to_definition(context: context)
+          schema.to_definition(context: context, parallel_workers: @parallel_workers)
         end
       else
         raise ArgumentError, "Unexpected schema dump method: #{method_name.inspect}"

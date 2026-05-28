@@ -1,5 +1,6 @@
 # frozen_string_literal: true
 require "digest/sha2"
+require "etc"
 require "fileutils"
 require "securerandom"
 
@@ -18,11 +19,16 @@ module GraphQL
     module CachedDump
       DEFAULT_CACHE_DIR = "tmp/cache/graphql"
 
+      # Minimum number of types before we bother forking fingerprint workers.
+      FINGERPRINT_FORK_THRESHOLD = 20
+      # Minimum number of cache-miss nodes before we bother forking render workers.
+      RENDER_FORK_THRESHOLD = 4
+
       FINGERPRINT_CACHE = {}.compare_by_identity
       private_constant :FINGERPRINT_CACHE
 
-      def self.fingerprints_for(schema)
-        FINGERPRINT_CACHE[schema] ||= compute_fingerprints(dumpable_types(schema))
+      def self.fingerprints_for(schema, num_workers: 1)
+        FINGERPRINT_CACHE[schema] ||= compute_fingerprints(dumpable_types(schema), num_workers: num_workers)
       end
       private_class_method :fingerprints_for
 
@@ -30,10 +36,10 @@ module GraphQL
         FINGERPRINT_CACHE.clear
       end
 
-      def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, **json_options)
+      def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, num_workers: [Etc.nprocessors, 8].min, **json_options)
         FileUtils.mkdir_p(cache_dir)
 
-        fingerprints = fingerprints_for(schema)
+        fingerprints = fingerprints_for(schema, num_workers: num_workers)
         options_key = Digest::SHA256.hexdigest(json_options.sort.map(&:inspect).join)
         merkle_root = Digest::SHA256.hexdigest(
           fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join
@@ -54,10 +60,10 @@ module GraphQL
         result
       end
 
-      def self.dump(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR)
+      def self.dump(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, num_workers: [Etc.nprocessors, 8].min)
         FileUtils.mkdir_p(File.join(cache_dir, "types"))
 
-        fingerprints = fingerprints_for(schema)
+        fingerprints = fingerprints_for(schema, num_workers: num_workers)
         types = fingerprints.keys
         merkle_root = Digest::SHA256.hexdigest(
           fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join
@@ -89,13 +95,54 @@ module GraphQL
         # We index the already-computed types by graphql_name for O(1) lookup.
         type_map = types.each_with_object({}) { |t, h| h[t.graphql_name] = t }
 
-        type_sdls = type_nodes.sort_by(&:name).map do |node|
+        sorted_type_nodes = type_nodes.sort_by(&:name)
+
+        # Identify cache misses up front so we can decide whether to parallelize.
+        hits = {}
+        misses = []  # array of [index_in_sorted, node, type_name, fingerprint]
+
+        sorted_type_nodes.each_with_index do |node, idx|
           type = type_map[node.name]
           if type
             fp = fingerprints[type]
-            fragment_for_node(node, type.graphql_name, fp, printer, cache_dir)
+            frag_path = File.join(cache_dir, "types", "#{type.graphql_name}_#{fp}.sdl")
+            begin
+              hits[idx] = File.read(frag_path, encoding: Encoding::UTF_8)
+            rescue Errno::ENOENT
+              misses << [idx, node, type.graphql_name, fp]
+            end
           else
-            printer.print(node)
+            # Node has no type in our map — will be rendered inline (no caching).
+            # Treat as a special hit with a nil fragment path.
+            hits[idx] = :inline
+          end
+        end
+
+        # Render cache misses — parallel if there are enough of them.
+        if misses.size >= RENDER_FORK_THRESHOLD && num_workers > 1
+          rendered_misses = parallel_render_fragments(misses, cache_dir, num_workers)
+        else
+          rendered_misses = {}
+          misses.each do |idx, node, _type_name, _fp|
+            rendered_misses[idx] = nil  # will be rendered below
+          end
+          misses.each do |idx, node, type_name, fp|
+            type = type_map[node.name]
+            rendered_misses[idx] = fragment_for_node(node, type_name, fp, printer, cache_dir)
+          end
+        end
+
+        # Assemble final SDL in sorted order.
+        type_sdls = sorted_type_nodes.each_with_index.map do |node, idx|
+          if hits.key?(idx)
+            val = hits[idx]
+            if val == :inline
+              printer.print(node)
+            else
+              val
+            end
+          else
+            rendered_misses[idx]
           end
         end
 
@@ -118,10 +165,112 @@ module GraphQL
       end
       private_class_method :dumpable_types
 
-      def self.compute_fingerprints(types)
-        types.each_with_object({}) { |type, h| h[type] = type_fingerprint(type) }
+      # Compute fingerprints, optionally in parallel.
+      # Returns a Hash[type => hex_digest].
+      def self.compute_fingerprints(types, num_workers: 1)
+        if num_workers > 1 && types.size >= FINGERPRINT_FORK_THRESHOLD
+          parallel_fingerprints(types, num_workers)
+        else
+          types.each_with_object({}) { |type, h| h[type] = type_fingerprint(type) }
+        end
       end
       private_class_method :compute_fingerprints
+
+      # Fork N workers to compute fingerprints in parallel.
+      # Each worker sends back a Hash[graphql_name => hex_digest] via a pipe.
+      # Parent reassembles the full Hash[type => hex_digest].
+      def self.parallel_fingerprints(types, num_workers)
+        batches = partition_into_batches(types, num_workers)
+        results_by_name = {}
+
+        workers = batches.map do |batch|
+          rd, wr = IO.pipe
+          pid = fork do
+            rd.close
+            result = {}
+            batch.each { |t| result[t.graphql_name] = type_fingerprint(t) }
+            wr.write(Marshal.dump(result))
+            wr.close
+            exit!(0)
+          end
+          wr.close
+          { pid: pid, rd: rd }
+        end
+
+        workers.each do |w|
+          raw = w[:rd].read
+          w[:rd].close
+          Marshal.load(raw).each { |name, fp| results_by_name[name] = fp }
+          _pid, status = Process.waitpid2(w[:pid])
+          unless status.success?
+            raise "CachedDump fingerprint worker (pid #{w[:pid]}) failed with status #{status.exitstatus}"
+          end
+        end
+
+        # Rebuild the Hash keyed by type object (not name) to match non-parallel shape.
+        type_by_name = types.each_with_object({}) { |t, h| h[t.graphql_name] = t }
+        results_by_name.each_with_object({}) do |(name, fp), h|
+          t = type_by_name[name]
+          h[t] = fp if t
+        end
+      end
+      private_class_method :parallel_fingerprints
+
+      # Fork N workers to render cache-miss SDL fragments and write them atomically.
+      # Returns a Hash[idx => sdl_string] for all entries in +misses+.
+      # Each miss entry is [idx, node, type_name, fingerprint].
+      def self.parallel_render_fragments(misses, cache_dir, num_workers)
+        batches = partition_into_batches(misses, num_workers)
+        results = {}
+
+        workers = batches.map do |batch|
+          rd, wr = IO.pipe
+          pid = fork do
+            rd.close
+            lang_printer = GraphQL::Language::Printer.new
+            batch_result = {}
+            batch.each do |idx, node, type_name, fp|
+              frag_path = File.join(cache_dir, "types", "#{type_name}_#{fp}.sdl")
+              # Another process may have already written this fragment — check first.
+              begin
+                sdl = File.read(frag_path, encoding: Encoding::UTF_8)
+              rescue Errno::ENOENT
+                sdl = lang_printer.print(node)
+                tmp = "#{frag_path}.#{Process.pid}.#{SecureRandom.hex(8)}"
+                File.binwrite(tmp, sdl)
+                File.rename(tmp, frag_path)
+              end
+              batch_result[idx] = sdl
+            end
+            wr.write(Marshal.dump(batch_result))
+            wr.close
+            exit!(0)
+          end
+          wr.close
+          { pid: pid, rd: rd }
+        end
+
+        workers.each do |w|
+          raw = w[:rd].read
+          w[:rd].close
+          Marshal.load(raw).each { |idx, sdl| results[idx] = sdl }
+          _pid, status = Process.waitpid2(w[:pid])
+          unless status.success?
+            raise "CachedDump render worker (pid #{w[:pid]}) failed with status #{status.exitstatus}"
+          end
+        end
+
+        results
+      end
+      private_class_method :parallel_render_fragments
+
+      # Divide +items+ into at most +n+ roughly equal batches (Array of Arrays).
+      def self.partition_into_batches(items, n)
+        return [items] if n <= 1 || items.empty?
+        actual = [n, items.size].min
+        items.each_slice((items.size.to_f / actual).ceil).to_a
+      end
+      private_class_method :partition_into_batches
 
       def self.hash_directives(d, directives)
         directives.sort_by(&:graphql_name).each do |dir|

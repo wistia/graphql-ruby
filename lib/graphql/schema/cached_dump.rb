@@ -25,11 +25,12 @@ module GraphQL
       # Minimum number of cache-miss nodes before we bother forking render workers.
       RENDER_FORK_THRESHOLD = 4
 
-      FINGERPRINT_CACHE = {}.compare_by_identity
+      FINGERPRINT_CACHE = {}
       private_constant :FINGERPRINT_CACHE
 
       def self.fingerprints_for(schema, parallel_workers: 1, cache_dir: DEFAULT_CACHE_DIR, watch_dirs: nil)
-        FINGERPRINT_CACHE[schema] ||= compute_and_persist_fingerprints(schema,
+        cache_key = [schema.object_id, cache_dir, watch_dirs&.sort]
+        FINGERPRINT_CACHE[cache_key] ||= compute_and_persist_fingerprints(schema,
           parallel_workers: parallel_workers,
           cache_dir: cache_dir,
           watch_dirs: watch_dirs
@@ -55,7 +56,7 @@ module GraphQL
               }
               return fps if fps.size == types.size
             end
-          rescue Errno::ENOENT, TypeError, ArgumentError
+          rescue Errno::ENOENT, TypeError, ArgumentError, NameError
             # Cache miss or corrupt file — fall through to compute
           end
         end
@@ -86,12 +87,13 @@ module GraphQL
       # (which reset mtimes to the current time, making mtime-based keys unreliable in CI).
       def self.source_hash(watch_dirs)
         d = Digest::SHA256.new
-        watch_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb").sort }.each do |path|
-          d << path << "\x00"
-          d << File.binread(path)
-          d << "\x00"
-        rescue Errno::ENOENT
-          next
+        # Sort + uniq after flat_map so overlapping watch_dirs don't double-hash files.
+        paths = watch_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }.sort.uniq
+        paths.each do |path|
+          # Read content before touching the digest: if the file vanishes between
+          # glob and read (TOCTOU), rescue before anything is mixed into the hash.
+          content = File.binread(path) rescue next
+          d << path << "\x00" << content << "\x00"
         end
         d.hexdigest
       end
@@ -107,11 +109,8 @@ module GraphQL
         )
 
         cache_path = File.join(cache_dir, "schema_#{merkle_root}_#{options_key}.json")
-        begin
-          return File.read(cache_path, encoding: Encoding::UTF_8)
-        rescue Errno::ENOENT
-          nil
-        end
+        cached = File.read(cache_path, encoding: Encoding::UTF_8) rescue nil
+        return cached if cached
 
         result = schema.to_json(context: context, **json_options)
 
@@ -131,11 +130,8 @@ module GraphQL
         )
 
         full_cache_path = File.join(cache_dir, "schema_#{merkle_root}.graphql")
-        begin
-          return File.read(full_cache_path, encoding: Encoding::UTF_8)
-        rescue Errno::ENOENT
-          nil
-        end
+        cached = File.read(full_cache_path, encoding: Encoding::UTF_8) rescue nil
+        return cached if cached
 
         # Partial / cold path: init the printer once (one Warden BFS) then render
         # only cache-miss types; all others come from the fragment store.
@@ -224,9 +220,15 @@ module GraphQL
       end
 
       def self.dumpable_types(schema)
-        base = schema.send(:non_introspection_types).values
-        extra = schema.extra_types
-        (base + extra).uniq.reject { |type| type.kind.scalar? && type.default_scalar? }
+        # non_introspection_types values can be Arrays (multiple definitions sharing a name,
+        # used with Schema::Visibility profiles). Flatten to get individual type modules.
+        base = schema.send(:non_introspection_types).values.flatten
+        extra = Array(schema.extra_types).flatten
+        # Deduplicate by graphql_name (not object identity) so same-name different-object
+        # duplicates from extra_types don't produce two entries with the same name in the
+        # persisted fingerprint file (which would corrupt the size-equality check).
+        all = (base + extra).uniq { |t| t.graphql_name }
+        all.reject { |type| type.kind.scalar? && type.default_scalar? }
       end
       private_class_method :dumpable_types
 
@@ -273,18 +275,25 @@ module GraphQL
           { pid: pid, rd: rd }
         end
 
+        first_error = nil
         workers.each do |w|
           tmp_path = w[:rd].read
           w[:rd].close
+          _pid, status = Process.waitpid2(w[:pid])
           begin
-            raise "CachedDump: worker (pid #{w[:pid]}) produced no result" if tmp_path.empty?
+            # Only raise if the worker produced no path — a SIGKILL after the path was
+            # written still delivers valid results, so check tmp_path first.
+            if tmp_path.empty?
+              raise "CachedDump: fingerprint worker (pid #{w[:pid]}) produced no result: #{worker_exit_description(status)}"
+            end
             Marshal.load(File.binread(tmp_path)).each { |name, fp| results_by_name[name] = fp }
+          rescue => e
+            first_error ||= e
           ensure
             File.unlink(tmp_path) rescue nil
-            _pid, status = Process.waitpid2(w[:pid])
-            raise "CachedDump fingerprint worker (pid #{w[:pid]}) failed: #{worker_exit_description(status)}" unless status.success?
           end
         end
+        raise first_error if first_error
 
         # Rebuild the Hash keyed by type object (not name) to match non-parallel shape.
         type_by_name = types.each_with_object({}) { |t, h| h[t.graphql_name] = t }
@@ -339,18 +348,23 @@ module GraphQL
           { pid: pid, rd: rd }
         end
 
+        first_error = nil
         workers.each do |w|
           tmp_path = w[:rd].read
           w[:rd].close
+          _pid, status = Process.waitpid2(w[:pid])
           begin
-            raise "CachedDump: worker (pid #{w[:pid]}) produced no result" if tmp_path.empty?
+            if tmp_path.empty?
+              raise "CachedDump: render worker (pid #{w[:pid]}) produced no result: #{worker_exit_description(status)}"
+            end
             Marshal.load(File.binread(tmp_path)).each { |idx, sdl| results[idx] = sdl }
+          rescue => e
+            first_error ||= e
           ensure
             File.unlink(tmp_path) rescue nil
-            _pid, status = Process.waitpid2(w[:pid])
-            raise "CachedDump render worker (pid #{w[:pid]}) failed: #{worker_exit_description(status)}" unless status.success?
           end
         end
+        raise first_error if first_error
 
         results
       end
@@ -506,11 +520,8 @@ module GraphQL
 
       def self.fragment_for_node(node, type_name, fingerprint, printer, cache_dir)
         frag_path = File.join(cache_dir, "types", "#{type_name}_#{fingerprint}.sdl")
-        begin
-          return File.read(frag_path, encoding: Encoding::UTF_8)
-        rescue Errno::ENOENT
-          nil
-        end
+        cached = File.read(frag_path, encoding: Encoding::UTF_8) rescue nil
+        return cached if cached
 
         sdl = printer.print(node)
         tmp = "#{frag_path}.#{Process.pid}.#{SecureRandom.hex(8)}"

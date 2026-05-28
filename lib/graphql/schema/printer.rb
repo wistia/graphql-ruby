@@ -184,18 +184,23 @@ module GraphQL
           { pid: pid, rd: rd }
         end
 
+        first_error = nil
         workers.each do |w|
           tmp_path = w[:rd].read
           w[:rd].close
+          _pid, status = Process.waitpid2(w[:pid])
           begin
-            raise "Schema::Printer: worker (pid #{w[:pid]}) produced no result" if tmp_path.empty?
+            if tmp_path.empty?
+              raise "Schema::Printer: render worker (pid #{w[:pid]}) produced no result: #{worker_exit_description(status)}"
+            end
             Marshal.load(File.binread(tmp_path)).each { |idx, sdl| results[idx] = sdl }
+          rescue => e
+            first_error ||= e
           ensure
             File.unlink(tmp_path) rescue nil
-            _pid, status = Process.waitpid2(w[:pid])
-            raise "Schema::Printer render worker (pid #{w[:pid]}) failed: #{worker_exit_description(status)}" unless status.success?
           end
         end
+        raise first_error if first_error
 
         results
       end

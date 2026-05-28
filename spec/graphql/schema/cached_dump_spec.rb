@@ -574,17 +574,22 @@ RSpec.describe GraphQL::Schema::CachedDump do
   # 5. FINGERPRINT_CACHE memoization
   # ---------------------------------------------------------------------------
   describe "FINGERPRINT_CACHE memoization" do
+    def cache_key(schema, cache_dir, watch_dirs = nil)
+      [schema.object_id, cache_dir, watch_dirs&.sort]
+    end
+
     it "calling dump twice on the same schema object uses memoized fingerprints" do
       Dir.mktmpdir do |dir|
         described_class.dump(test_schema, cache_dir: dir)
+        key = cache_key(test_schema, dir)
         expect(fp_cache.size).to eq(1)
-        expect(fp_cache).to have_key(test_schema)
+        expect(fp_cache).to have_key(key)
 
-        first_fingerprints = fp_cache[test_schema]
+        first_fingerprints = fp_cache[key]
 
         described_class.dump(test_schema, cache_dir: dir)
         expect(fp_cache.size).to eq(1)
-        expect(fp_cache[test_schema]).to equal(first_fingerprints)  # same object_id
+        expect(fp_cache[key]).to equal(first_fingerprints)  # same object_id
       end
     end
 
@@ -599,8 +604,8 @@ RSpec.describe GraphQL::Schema::CachedDump do
         described_class.dump(schema2, cache_dir: dir)
 
         expect(fp_cache.size).to eq(2)
-        expect(fp_cache).to have_key(schema1)
-        expect(fp_cache).to have_key(schema2)
+        expect(fp_cache).to have_key(cache_key(schema1, dir))
+        expect(fp_cache).to have_key(cache_key(schema2, dir))
       end
     end
   end
@@ -925,6 +930,92 @@ RSpec.describe GraphQL::Schema::CachedDump do
       Dir.mktmpdir do |cache_dir|
         described_class.dump(test_schema, cache_dir: cache_dir)
         expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal")).to be_empty
+      end
+    end
+
+    it "does not create fingerprint files when watch_dirs is an empty array" do
+      Dir.mktmpdir do |cache_dir|
+        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [])
+        expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal")).to be_empty
+      end
+    end
+
+    it "falls through to recomputation when the marshal file is corrupted" do
+      Dir.mktmpdir do |cache_dir|
+        sh = described_class.send(:source_hash, [watch_dir])
+        fprint_path = File.join(cache_dir, "fingerprints_#{sh}.marshal")
+        File.binwrite(fprint_path, "this is not valid marshal data \x00\xFF\xFF")
+
+        expect {
+          result = described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+          expect(result.strip).to eq(test_schema.to_definition.strip)
+        }.not_to raise_error
+
+        expect { Marshal.load(File.binread(fprint_path)) }.not_to raise_error
+      end
+    end
+
+    it "falls through to recomputation when persisted type count does not match schema" do
+      Dir.mktmpdir do |cache_dir|
+        sh = described_class.send(:source_hash, [watch_dir])
+        fprint_path = File.join(cache_dir, "fingerprints_#{sh}.marshal")
+        stale = { "Query" => "a" * 64 }
+        File.binwrite(fprint_path, Marshal.dump(stale))
+
+        result = described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        expect(result.strip).to eq(test_schema.to_definition.strip)
+
+        fresh = Marshal.load(File.binread(fprint_path))
+        expect(fresh.size).to eq(described_class.send(:dumpable_types, test_schema).size)
+      end
+    end
+
+    it "skips compute_fingerprints on a warm disk-load run" do
+      Dir.mktmpdir do |cache_dir|
+        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        fp_cache.clear
+
+        expect(described_class).not_to receive(:compute_fingerprints)
+        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+      end
+    end
+
+    it "works correctly when a watched directory contains no .rb files" do
+      Dir.mktmpdir do |empty_dir|
+        File.write(File.join(empty_dir, "README.md"), "# not ruby")
+        Dir.mktmpdir do |cache_dir|
+          result = described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [empty_dir])
+          expect(result.strip).to eq(test_schema.to_definition.strip)
+          expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal").length).to eq(1)
+        end
+      end
+    end
+
+    describe "source_hash" do
+      it "is deterministic across multiple calls with the same files" do
+        h1 = described_class.send(:source_hash, [watch_dir])
+        h2 = described_class.send(:source_hash, [watch_dir])
+        expect(h1).to eq(h2)
+        expect(h1).to match(/\A[0-9a-f]{64}\z/)
+      end
+
+      it "changes when a file's content changes" do
+        h1 = described_class.send(:source_hash, [watch_dir])
+        File.write(File.join(watch_dir, "types.rb"), "# changed")
+        h2 = described_class.send(:source_hash, [watch_dir])
+        expect(h1).not_to eq(h2)
+      end
+
+      it "does not double-hash files when watch_dirs contains overlapping paths" do
+        subdir = File.join(watch_dir, "sub")
+        FileUtils.mkdir_p(subdir)
+        File.write(File.join(subdir, "nested.rb"), "# nested")
+
+        # Single dir hash includes the nested file once
+        h_single = described_class.send(:source_hash, [watch_dir])
+        # Passing the subdir again must produce the same hash (overlapping entries deduplicated)
+        h_overlap = described_class.send(:source_hash, [watch_dir, subdir])
+        expect(h_single).to eq(h_overlap)
       end
     end
   end

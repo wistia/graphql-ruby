@@ -82,6 +82,37 @@ module GraphQL
         FINGERPRINT_CACHE.clear
       end
 
+      # Attempt to return a cached SDL file without loading any schema types.
+      # Only possible when watch_dirs is set (so we can derive the merkle root from
+      # the on-disk fingerprint marshal file without calling ensure_loaded).
+      # Returns the cached String on hit, nil on miss.
+      def self.fast_path_cached_sdl(cache_dir, watch_dirs, suffix_key, extension)
+        return nil unless watch_dirs && !watch_dirs.empty?
+
+        sh = source_hash(watch_dirs)
+        fprint_path = File.join(cache_dir, "fingerprints_#{sh}.marshal")
+        persisted = Marshal.load(File.binread(fprint_path))
+        merkle_root = Digest::SHA256.hexdigest(
+          persisted.sort_by { |name, _| name }.map { |name, fp| "#{name}:#{fp}" }.join
+        )
+        if suffix_key
+          cache_path = File.join(cache_dir, "schema_#{merkle_root}_#{suffix_key}#{extension}")
+        else
+          cache_path = File.join(cache_dir, "schema_#{merkle_root}#{extension}")
+        end
+        File.read(cache_path, encoding: Encoding::UTF_8)
+      rescue Errno::ENOENT, TypeError, ArgumentError, NameError
+        nil
+      end
+      private_class_method :fast_path_cached_sdl
+
+      def self.compute_merkle_root(fingerprints)
+        Digest::SHA256.hexdigest(
+          fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join
+        )
+      end
+      private_class_method :compute_merkle_root
+
       # Compute a SHA256 of all .rb file contents under the given directories.
       # Used as a stable cache key for persisted fingerprints that survives git checkouts
       # (which reset mtimes to the current time, making mtime-based keys unreliable in CI).
@@ -105,11 +136,16 @@ module GraphQL
       def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, watch_dirs: nil, **json_options)
         FileUtils.mkdir_p(cache_dir)
 
-        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs)
         options_key = Digest::SHA256.hexdigest(json_options.sort.map(&:inspect).join)
-        merkle_root = Digest::SHA256.hexdigest(
-          fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join
-        )
+
+        # Fast path: if watch_dirs is set, try to derive the merkle root purely from
+        # the on-disk fingerprint file — no ensure_loaded, no type loading at all.
+        if (sdl = fast_path_cached_sdl(cache_dir, watch_dirs, options_key, ".json"))
+          return sdl
+        end
+
+        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs)
+        merkle_root = compute_merkle_root(fingerprints)
 
         cache_path = File.join(cache_dir, "schema_#{merkle_root}_#{options_key}.json")
         cached = File.read(cache_path, encoding: Encoding::UTF_8) rescue nil
@@ -126,11 +162,15 @@ module GraphQL
       def self.dump(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, watch_dirs: nil)
         FileUtils.mkdir_p(File.join(cache_dir, "types"))
 
+        # Fast path: if watch_dirs is set, try to derive the merkle root purely from
+        # the on-disk fingerprint file — no ensure_loaded, no type loading at all.
+        if (sdl = fast_path_cached_sdl(cache_dir, watch_dirs, nil, ".graphql"))
+          return sdl
+        end
+
         fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs)
         types = fingerprints.keys
-        merkle_root = Digest::SHA256.hexdigest(
-          fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join
-        )
+        merkle_root = compute_merkle_root(fingerprints)
 
         full_cache_path = File.join(cache_dir, "schema_#{merkle_root}.graphql")
         cached = File.read(full_cache_path, encoding: Encoding::UTF_8) rescue nil

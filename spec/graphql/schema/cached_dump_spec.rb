@@ -1042,6 +1042,20 @@ RSpec.describe GraphQL::Schema::CachedDump do
       end
     end
 
+    it "skips fingerprints_for entirely on a fully warm run (fast path)" do
+      Dir.mktmpdir do |cache_dir|
+        # Cold run: builds fingerprint marshal + SDL cache
+        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        fp_cache.clear
+
+        # Fully warm run: fingerprint marshal + SDL file both exist.
+        # fingerprints_for must never be called — the fast path returns before it.
+        expect(described_class).not_to receive(:fingerprints_for)
+        result = described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        expect(result.strip).to eq(test_schema.to_definition.strip)
+      end
+    end
+
     it "works correctly when a watched directory contains no .rb files" do
       Dir.mktmpdir do |empty_dir|
         File.write(File.join(empty_dir, "README.md"), "# not ruby")

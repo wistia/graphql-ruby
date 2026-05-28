@@ -188,15 +188,27 @@ module GraphQL
           tmp_path = w[:rd].read
           w[:rd].close
           begin
+            raise "Schema::Printer: worker (pid #{w[:pid]}) produced no result" if tmp_path.empty?
             Marshal.load(File.binread(tmp_path)).each { |idx, sdl| results[idx] = sdl }
           ensure
             File.unlink(tmp_path) rescue nil
             _pid, status = Process.waitpid2(w[:pid])
-            raise "Schema::Printer render worker (pid #{w[:pid]}) failed with status #{status.exitstatus}" unless status.success?
+            raise "Schema::Printer render worker (pid #{w[:pid]}) failed: #{worker_exit_description(status)}" unless status.success?
           end
         end
 
         results
+      end
+
+      def worker_exit_description(status)
+        if status.exitstatus
+          "exit status #{status.exitstatus}"
+        elsif status.termsig
+          sig = Signal.signame(status.termsig) rescue status.termsig.to_s
+          "killed by signal #{sig} (#{status.termsig})"
+        else
+          "unknown exit"
+        end
       end
     end
   end

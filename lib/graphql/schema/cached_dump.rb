@@ -133,6 +133,10 @@ module GraphQL
           end
         end
 
+        misses.each do |idx, node, type_name, _fp|
+          raise "CachedDump: failed to render type '#{type_name}' (node index #{idx})" if rendered_misses[idx].nil?
+        end
+
         # Assemble final SDL in sorted order.
         type_sdls = sorted_type_nodes.each_with_index.map do |node, idx|
           if hits.key?(idx)
@@ -213,11 +217,12 @@ module GraphQL
           tmp_path = w[:rd].read
           w[:rd].close
           begin
+            raise "CachedDump: worker (pid #{w[:pid]}) produced no result" if tmp_path.empty?
             Marshal.load(File.binread(tmp_path)).each { |name, fp| results_by_name[name] = fp }
           ensure
             File.unlink(tmp_path) rescue nil
             _pid, status = Process.waitpid2(w[:pid])
-            raise "CachedDump fingerprint worker (pid #{w[:pid]}) failed with status #{status.exitstatus}" unless status.success?
+            raise "CachedDump fingerprint worker (pid #{w[:pid]}) failed: #{worker_exit_description(status)}" unless status.success?
           end
         end
 
@@ -278,11 +283,12 @@ module GraphQL
           tmp_path = w[:rd].read
           w[:rd].close
           begin
+            raise "CachedDump: worker (pid #{w[:pid]}) produced no result" if tmp_path.empty?
             Marshal.load(File.binread(tmp_path)).each { |idx, sdl| results[idx] = sdl }
           ensure
             File.unlink(tmp_path) rescue nil
             _pid, status = Process.waitpid2(w[:pid])
-            raise "CachedDump render worker (pid #{w[:pid]}) failed with status #{status.exitstatus}" unless status.success?
+            raise "CachedDump render worker (pid #{w[:pid]}) failed: #{worker_exit_description(status)}" unless status.success?
           end
         end
 
@@ -360,13 +366,13 @@ module GraphQL
               hash_directives(d, arg.directives)
             end
           end
-          type.interface_type_memberships.sort_by { |m| m.abstract_type.to_s }.each do |m|
-            d << m.abstract_type.to_s
+          type.interface_type_memberships.sort_by { |m| m.abstract_type.graphql_name }.each do |m|
+            d << m.abstract_type.graphql_name
             d << "\x00"
           end
         when "UNION"
-          type.type_memberships.sort_by { |m| m.object_type.to_s }.each do |m|
-            d << m.object_type.to_s
+          type.type_memberships.sort_by { |m| m.object_type.graphql_name }.each do |m|
+            d << m.object_type.graphql_name
             d << "\x00"
           end
         when "ENUM"
@@ -409,6 +415,18 @@ module GraphQL
         d.hexdigest
       end
       private_class_method :type_fingerprint
+
+      def self.worker_exit_description(status)
+        if status.exitstatus
+          "exit status #{status.exitstatus}"
+        elsif status.termsig
+          sig = Signal.signame(status.termsig) rescue status.termsig.to_s
+          "killed by signal #{sig} (#{status.termsig})"
+        else
+          "unknown exit"
+        end
+      end
+      private_class_method :worker_exit_description
 
       def self.fragment_for_node(node, type_name, fingerprint, printer, cache_dir)
         frag_path = File.join(cache_dir, "types", "#{type_name}_#{fingerprint}.sdl")

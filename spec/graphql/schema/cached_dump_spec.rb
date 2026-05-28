@@ -894,6 +894,8 @@ RSpec.describe GraphQL::Schema::CachedDump do
       Dir.mktmpdir do |dir|
         serial = described_class.dump_json(large_schema, cache_dir: dir, parallel_workers: 1)
         fp_cache.clear
+        FileUtils.rm_rf(dir)
+        FileUtils.mkdir_p(dir)
         parallel = described_class.dump_json(large_schema, cache_dir: dir, parallel_workers: 4)
         expect(JSON.parse(parallel)).to eq(JSON.parse(serial))
       end
@@ -919,7 +921,7 @@ RSpec.describe GraphQL::Schema::CachedDump do
       Dir.mktmpdir do |dir|
         described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
         sdl_files = Dir.glob("#{dir}/types/*.sdl")
-        expect(sdl_files.length).to be >= 25
+        expect(sdl_files.length).to eq(26)  # Query + Type1..Type25
       end
     end
   end

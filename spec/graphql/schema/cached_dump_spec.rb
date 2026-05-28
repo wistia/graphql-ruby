@@ -363,6 +363,38 @@ RSpec.describe GraphQL::Schema::CachedDump do
       end
     end
 
+    it "changing a resolver-backed field's return type invalidates the type's fragment" do
+      Dir.mktmpdir do |dir|
+        resolver_v1 = Class.new(GraphQL::Schema::Resolver) do
+          type String, null: true
+          def resolve; "hello"; end
+        end
+        resolver_v2 = Class.new(GraphQL::Schema::Resolver) do
+          type Integer, null: false
+          def resolve; 42; end
+        end
+
+        q_v1 = Class.new(GraphQL::Schema::Object) do
+          graphql_name "Query"
+          field :thing, resolver: resolver_v1
+        end
+        schema_v1 = Class.new(GraphQL::Schema) { query q_v1 }
+
+        q_v2 = Class.new(GraphQL::Schema::Object) do
+          graphql_name "Query"
+          field :thing, resolver: resolver_v2
+        end
+        schema_v2 = Class.new(GraphQL::Schema) { query q_v2 }
+
+        described_class.dump(schema_v1, cache_dir: dir)
+        fp_cache.clear
+        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
+
+        expect(Dir.glob("#{dir}/types/Query_*.sdl").length).to eq(2)
+        expect(result_v2).to include("thing: Int!")
+      end
+    end
+
     it "changing a union member set invalidates the union's fragment" do
       Dir.mktmpdir do |dir|
         type_a = Class.new(GraphQL::Schema::Object) do
@@ -862,6 +894,35 @@ RSpec.describe GraphQL::Schema::CachedDump do
         expect(idl_content.strip).to eq(rake_schema.to_definition.strip)
       end
     end
+
+    it "passes watch_dirs to CachedDump when configured" do
+      Dir.mktmpdir do |out_dir|
+        Dir.mktmpdir do |wdir|
+          File.write(File.join(wdir, "types.rb"), "# schema source")
+
+          allow(GraphQL::Schema::CachedDump).to receive(:dump).and_call_original
+
+          ns = "rake_watch_#{rand(99999)}"
+          task_obj = GraphQL::RakeTask.new(
+            namespace: ns,
+            idl_outfile: File.join(out_dir, "schema.graphql"),
+            json_outfile: File.join(out_dir, "schema.json")
+          ) do |t|
+            t.load_schema = ->(_task) { rake_schema }
+            t.cache_dir = out_dir
+            t.watch_dirs = [wdir]
+          end
+
+          task_obj.send(:write_outfile, :to_definition, File.join(out_dir, "schema.graphql"))
+
+          expect(GraphQL::Schema::CachedDump).to have_received(:dump).with(
+            rake_schema,
+            hash_including(watch_dirs: [wdir])
+          )
+          fp_cache.clear
+        end
+      end
+    end
   end
 
   # ---------------------------------------------------------------------------
@@ -870,11 +931,12 @@ RSpec.describe GraphQL::Schema::CachedDump do
   describe "persisted fingerprints (watch_dirs:)" do
     let(:watch_dir) do
       dir = Dir.mktmpdir
+      @_watch_dir_created = dir
       File.write(File.join(dir, "types.rb"), "# schema source")
       dir
     end
 
-    after { FileUtils.rm_rf(watch_dir) }
+    after { FileUtils.rm_rf(@_watch_dir_created) if @_watch_dir_created }
 
     it "persists fingerprint file on cold run" do
       Dir.mktmpdir do |cache_dir|

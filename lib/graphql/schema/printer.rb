@@ -148,6 +148,13 @@ module GraphQL
       # through the pipe (a short string that never overflows the 64KB pipe buffer).
       # Returns a Hash[index => rendered_string] covering all nodes.
       def fork_render_nodes(nodes, num_workers)
+        # fork(2) is unsafe in multi-threaded processes — fall back to serial.
+        if Thread.list.size > 1
+          return nodes.each_with_index.each_with_object({}) do |(n, i), h|
+            h[i] = GraphQL::Language::Printer.new.print(n)
+          end
+        end
+
         actual_workers = [num_workers, nodes.size].min
         slice_size = (nodes.size.to_f / actual_workers).ceil
 

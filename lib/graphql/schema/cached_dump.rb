@@ -88,7 +88,10 @@ module GraphQL
       def self.source_hash(watch_dirs)
         d = Digest::SHA256.new
         # Sort + uniq after flat_map so overlapping watch_dirs don't double-hash files.
-        paths = watch_dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }.sort.uniq
+        # Coerce to Array so a caller who accidentally passes a String gets a clear error
+        # from Dir.glob rather than iterating String characters.
+        dirs = Array(watch_dirs)
+        paths = dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }.sort.uniq
         paths.each do |path|
           # Read content before touching the digest: if the file vanishes between
           # glob and read (TOCTOU), rescue before anything is mixed into the hash.
@@ -142,8 +145,7 @@ module GraphQL
         # Type nodes are individually cached.
         document = printer.instance_variable_get(:@document)
         header_nodes, type_nodes = document.definitions.partition do |node|
-          !node.is_a?(GraphQL::Language::Nodes::AbstractNode) ||
-            node.class.name !~ /TypeDefinition$/
+          node.class.name !~ /TypeDefinition$/
         end
 
         header_sdl = header_nodes.map { |n| printer.print(n) }.join("\n\n")
@@ -180,11 +182,7 @@ module GraphQL
           rendered_misses = parallel_render_fragments(misses, cache_dir, parallel_workers)
         else
           rendered_misses = {}
-          misses.each do |idx, node, _type_name, _fp|
-            rendered_misses[idx] = nil  # will be rendered below
-          end
           misses.each do |idx, node, type_name, fp|
-            type = type_map[node.name]
             rendered_misses[idx] = fragment_for_node(node, type_name, fp, printer, cache_dir)
           end
         end
@@ -248,6 +246,13 @@ module GraphQL
       # through the pipe (a short string that never overflows the 64KB pipe buffer).
       # Parent reassembles the full Hash[type => hex_digest].
       def self.parallel_fingerprints(types, num_workers)
+        # fork(2) is unsafe in multi-threaded processes: mutexes held by other threads are
+        # copied locked into the child with no owner, causing deadlocks. Fall back to serial
+        # if more than one thread is live (e.g. Puma worker threads, AR connection pool).
+        if Thread.list.size > 1
+          return types.each_with_object({}) { |type, h| h[type] = type_fingerprint(type) }
+        end
+
         batches = partition_into_batches(types, num_workers)
         results_by_name = {}
 
@@ -308,6 +313,12 @@ module GraphQL
       # Returns a Hash[idx => sdl_string] for all entries in +misses+.
       # Each miss entry is [idx, node, type_name, fingerprint].
       def self.parallel_render_fragments(misses, cache_dir, num_workers)
+        if Thread.list.size > 1
+          rendered = {}
+          misses.each { |idx, node, type_name, fp| rendered[idx] = fragment_for_node(node, type_name, fp, GraphQL::Language::Printer.new, cache_dir) }
+          return rendered
+        end
+
         batches = partition_into_batches(misses, num_workers)
         results = {}
 
@@ -427,9 +438,17 @@ module GraphQL
             d << "\x00"
             # Read raw type expr directly — avoids calling field.type which triggers ensure_loaded.
             # Use stable_type_expr to handle already-resolved Class objects (avoid #<Class:0xADDR>).
-            d << stable_type_expr(field.instance_variable_get(:@return_type_expr))
+            # For resolver-backed fields, @return_type_expr is nil on the field; fall back to the
+            # resolver class's type_expr and null (which carry the actual declared type).
+            type_expr = field.instance_variable_get(:@return_type_expr)
+            type_null  = field.instance_variable_get(:@return_type_null)
+            if type_expr.nil? && (rc = field.instance_variable_get(:@resolver_class))
+              type_expr = rc.type_expr
+              type_null = rc.null if type_null.nil?
+            end
+            d << stable_type_expr(type_expr)
             d << "\x00"
-            d << field.instance_variable_get(:@return_type_null).inspect
+            d << type_null.inspect
             d << "\x00"
             d << field.description.to_s
             d << "\x00"
@@ -474,8 +493,6 @@ module GraphQL
             d << v.comment.to_s
             d << "\x00"
             d << v.deprecation_reason.to_s
-            d << "\x00"
-            d << v.value.inspect
             d << "\x00"
             hash_directives(d, v.directives)
           end

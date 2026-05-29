@@ -3,6 +3,7 @@ require "digest/sha2"
 require "etc"
 require "fileutils"
 require "securerandom"
+require "set"
 require "tmpdir"
 
 module GraphQL
@@ -16,7 +17,8 @@ module GraphQL
     # Warm run (nothing changed): returns cached full SDL immediately — no Warden BFS,
     # no ensure_loaded, no AST construction.
     #
-    # Partial change: re-renders only changed types, assembles from fragments.
+    # Partial change: re-fingerprints only types whose source files changed, trusts
+    # cached fingerprints for the rest. Re-renders only types whose fingerprints changed.
     module CachedDump
       DEFAULT_CACHE_DIR = "tmp/cache/graphql"
 
@@ -28,81 +30,227 @@ module GraphQL
       FINGERPRINT_CACHE = {}
       private_constant :FINGERPRINT_CACHE
 
-      def self.fingerprints_for(schema, parallel_workers: 1, cache_dir: DEFAULT_CACHE_DIR, watch_dirs: nil)
+      def self.fingerprints_for(schema, parallel_workers: 1, cache_dir: DEFAULT_CACHE_DIR, watch_dirs: nil, current_manifest: nil)
         cache_key = [schema.object_id, cache_dir, watch_dirs&.sort]
         FINGERPRINT_CACHE[cache_key] ||= compute_and_persist_fingerprints(schema,
           parallel_workers: parallel_workers,
           cache_dir: cache_dir,
-          watch_dirs: watch_dirs
+          watch_dirs: watch_dirs,
+          current_manifest: current_manifest
         )
       end
       private_class_method :fingerprints_for
 
-      def self.compute_and_persist_fingerprints(schema, parallel_workers:, cache_dir:, watch_dirs:)
-        sh = nil
-
-        # Try loading persisted fingerprints from disk (skips ensure_loaded entirely)
+      def self.compute_and_persist_fingerprints(schema, parallel_workers:, cache_dir:, watch_dirs:, current_manifest:)
         if watch_dirs && !watch_dirs.empty?
-          sh = source_hash(watch_dirs)
-          fprint_path = File.join(cache_dir, "fingerprints_#{sh}.marshal")
-          begin
-            persisted = Marshal.load(File.binread(fprint_path))
-            types = dumpable_types(schema)
-            if persisted.size == types.size
-              type_by_name = types.each_with_object({}) { |t, h| h[t.graphql_name] = t }
-              fps = persisted.each_with_object({}) { |(name, fp), h|
-                t = type_by_name[name]
-                h[t] = fp if t
-              }
-              return fps if fps.size == types.size
-            end
-          rescue Errno::ENOENT, TypeError, ArgumentError, NameError
-            # Cache miss or corrupt file — fall through to compute
+          incremental_fingerprints(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs, current_manifest: current_manifest)
+        else
+          compute_fingerprints(dumpable_types(schema), parallel_workers: parallel_workers)
+        end
+      end
+      private_class_method :compute_and_persist_fingerprints
+
+      # Incremental fingerprinting: uses a per-file manifest to detect which files
+      # changed, then re-fingerprints only types defined in those files.
+      # Persists: manifest.marshal ({path => sha256}), fingerprints.marshal ({name => {fp:, src:}})
+      def self.incremental_fingerprints(schema, parallel_workers:, cache_dir:, watch_dirs:, current_manifest: nil)
+        manifest_path = File.join(cache_dir, "manifest.marshal")
+        fprint_path = File.join(cache_dir, "fingerprints.marshal")
+
+        current_manifest ||= build_file_manifest(watch_dirs)
+        old_manifest = load_marshal(manifest_path)
+        old_fprints = load_marshal(fprint_path)  # {name => {fp: "hex", src: "/path.rb"}}
+
+        types = dumpable_types(schema)
+        type_by_name = types.each_with_object({}) { |t, h| h[t.graphql_name] = t }
+
+        if old_manifest && old_fprints && old_manifest == current_manifest && old_fprints.size == types.size
+          # Nothing changed — trust all cached fingerprints
+          fps = {}
+          old_fprints.each do |name, entry|
+            t = type_by_name[name]
+            fps[t] = entry[:fp] if t
+          end
+          if fps.size == types.size
+            persist_manifest_and_fingerprints(manifest_path, current_manifest, fprint_path, old_fprints)
+            return fps
           end
         end
 
-        # Full computation (pays ensure_loaded cost)
-        fps = compute_fingerprints(dumpable_types(schema), parallel_workers: parallel_workers)
+        # Determine which files changed
+        changed_files = changed_file_set(old_manifest, current_manifest)
 
-        # Persist to disk for future runs
-        if watch_dirs && !watch_dirs.empty?
-          sh ||= source_hash(watch_dirs)
-          fprint_path = File.join(cache_dir, "fingerprints_#{sh}.marshal")
-          by_name = fps.each_with_object({}) { |(t, fp), h| h[t.graphql_name] = fp }
-          tmp = "#{fprint_path}.#{Process.pid}.#{SecureRandom.hex(8)}"
-          File.binwrite(tmp, Marshal.dump(by_name))
-          File.rename(tmp, fprint_path)
+        if old_fprints && !changed_files.nil? && old_fprints.size == types.size
+          # Partial change strategy:
+          # 1. Re-fingerprint only types whose source files changed (mapped types)
+          # 2. If unmapped files changed, re-fingerprint all mapped types (concerns may have changed)
+          # 3. Trust cached fingerprints for auto-generated (sourceless) types UNLESS
+          #    a mapped type's fingerprint actually changed (which could affect connections/edges)
+          mapped_files = Set.new
+          old_fprints.each_value { |entry| mapped_files << entry[:src] if entry[:src] }
+
+          unmapped_changed = changed_files.any? { |f| !mapped_files.include?(f) }
+
+          # Phase 1: re-fingerprint mapped types whose source (or a concern) changed
+          mapped_types_to_recompute = []
+          mapped_types_from_cache = []
+          sourceless_types = []
+
+          types.each do |t|
+            entry = old_fprints[t.graphql_name]
+            if entry.nil?
+              mapped_types_to_recompute << t
+            elsif entry[:src].nil?
+              sourceless_types << t
+            elsif changed_files.include?(entry[:src])
+              mapped_types_to_recompute << t
+            elsif unmapped_changed
+              mapped_types_to_recompute << t
+            else
+              mapped_types_from_cache << t
+            end
+          end
+
+          # Build fps for mapped types
+          fps = {}
+          mapped_types_from_cache.each do |t|
+            fps[t] = old_fprints[t.graphql_name][:fp]
+          end
+
+          any_mapped_fp_changed = false
+          if mapped_types_to_recompute.any?
+            recomputed = compute_fingerprints(mapped_types_to_recompute, parallel_workers: parallel_workers)
+            recomputed.each do |t, fp|
+              old_entry = old_fprints[t.graphql_name]
+              if old_entry.nil? || old_entry[:fp] != fp
+                any_mapped_fp_changed = true
+              end
+            end
+            fps.merge!(recomputed)
+          end
+
+          # Phase 2: for sourceless types (connections/edges), trust cache unless
+          # a mapped type's fingerprint actually changed
+          if any_mapped_fp_changed
+            recomputed_sourceless = compute_fingerprints(sourceless_types, parallel_workers: parallel_workers)
+            fps.merge!(recomputed_sourceless)
+          else
+            sourceless_types.each do |t|
+              fps[t] = old_fprints[t.graphql_name][:fp]
+            end
+          end
+        else
+          # Cold start or type count mismatch — compute everything
+          fps = compute_fingerprints(types, parallel_workers: parallel_workers)
         end
+
+        # Persist manifest + fingerprints with source locations
+        new_fprints = {}
+        fps.each do |t, fp|
+          src = type_source_file(t)
+          new_fprints[t.graphql_name] = { fp: fp, src: src }
+        end
+        persist_manifest_and_fingerprints(manifest_path, current_manifest, fprint_path, new_fprints)
 
         fps
       end
-      private_class_method :compute_and_persist_fingerprints
+      private_class_method :incremental_fingerprints
+
+      # Build a manifest of {path => content_sha256} for all .rb files in watch_dirs.
+      def self.build_file_manifest(watch_dirs)
+        dirs = Array(watch_dirs)
+        paths = dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }.sort.uniq
+        manifest = {}
+        paths.each do |path|
+          content = File.binread(path) rescue next
+          manifest[path] = Digest::SHA256.hexdigest(content)
+        end
+        manifest
+      end
+      private_class_method :build_file_manifest
+
+      # Returns a Set of file paths that changed between old and current manifest,
+      # or nil if old_manifest is nil (cold start).
+      def self.changed_file_set(old_manifest, current_manifest)
+        return nil unless old_manifest
+        changed = Set.new
+        # Modified or added files
+        current_manifest.each do |path, hash|
+          if old_manifest[path] != hash
+            changed << path
+          end
+        end
+        # Removed files
+        old_manifest.each_key do |path|
+          changed << path unless current_manifest.key?(path)
+        end
+        changed
+      end
+      private_class_method :changed_file_set
+
+      # Get the source file for a type class using const_source_location.
+      def self.type_source_file(type)
+        return nil unless type.name
+        loc = Object.const_source_location(type.name)
+        loc&.first
+      rescue NameError, TypeError
+        nil
+      end
+      private_class_method :type_source_file
+
+      def self.load_marshal(path)
+        Marshal.load(File.binread(path))
+      rescue Errno::ENOENT, TypeError, ArgumentError, NameError
+        nil
+      end
+      private_class_method :load_marshal
+
+      def self.persist_manifest_and_fingerprints(manifest_path, manifest, fprint_path, fprints)
+        atomic_write(manifest_path, Marshal.dump(manifest))
+        atomic_write(fprint_path, Marshal.dump(fprints))
+      end
+      private_class_method :persist_manifest_and_fingerprints
+
+      def self.atomic_write(path, data)
+        tmp = "#{path}.#{Process.pid}.#{SecureRandom.hex(8)}"
+        File.binwrite(tmp, data)
+        File.rename(tmp, path)
+      end
+      private_class_method :atomic_write
 
       def self.clear_cache
         FINGERPRINT_CACHE.clear
       end
 
       # Attempt to return a cached SDL file without loading any schema types.
-      # Only possible when watch_dirs is set (so we can derive the merkle root from
-      # the on-disk fingerprint marshal file without calling ensure_loaded).
-      # Returns the cached String on hit, nil on miss.
+      # Checks the file manifest for changes — if no files changed since the last run,
+      # derives the merkle root from persisted fingerprints and returns the cached SDL.
+      # Returns [sdl_string_or_nil, current_manifest] so callers can reuse the manifest.
       def self.fast_path_cached_sdl(cache_dir, watch_dirs, suffix_key, extension)
-        return nil unless watch_dirs && !watch_dirs.empty?
+        return [nil, nil] unless watch_dirs && !watch_dirs.empty?
 
-        sh = source_hash(watch_dirs)
-        fprint_path = File.join(cache_dir, "fingerprints_#{sh}.marshal")
-        persisted = Marshal.load(File.binread(fprint_path))
+        manifest_path = File.join(cache_dir, "manifest.marshal")
+        fprint_path = File.join(cache_dir, "fingerprints.marshal")
+
+        old_manifest = load_marshal(manifest_path)
+        current_manifest = build_file_manifest(watch_dirs)
+        return [nil, current_manifest] unless old_manifest && old_manifest == current_manifest
+
+        persisted = load_marshal(fprint_path)
+        return [nil, current_manifest] unless persisted
+
         merkle_root = Digest::SHA256.hexdigest(
-          persisted.sort_by { |name, _| name }.map { |name, fp| "#{name}:#{fp}" }.join
+          persisted.sort_by { |name, _| name }.map { |name, entry| "#{name}:#{entry[:fp]}" }.join
         )
         if suffix_key
           cache_path = File.join(cache_dir, "schema_#{merkle_root}_#{suffix_key}#{extension}")
         else
           cache_path = File.join(cache_dir, "schema_#{merkle_root}#{extension}")
         end
-        File.read(cache_path, encoding: Encoding::UTF_8)
+        sdl = File.read(cache_path, encoding: Encoding::UTF_8)
+        [sdl, current_manifest]
       rescue Errno::ENOENT, TypeError, ArgumentError, NameError
-        nil
+        [nil, current_manifest]
       end
       private_class_method :fast_path_cached_sdl
 
@@ -113,26 +261,6 @@ module GraphQL
       end
       private_class_method :compute_merkle_root
 
-      # Compute a SHA256 of all .rb file contents under the given directories.
-      # Used as a stable cache key for persisted fingerprints that survives git checkouts
-      # (which reset mtimes to the current time, making mtime-based keys unreliable in CI).
-      def self.source_hash(watch_dirs)
-        d = Digest::SHA256.new
-        # Sort + uniq after flat_map so overlapping watch_dirs don't double-hash files.
-        # Coerce to Array so a caller who accidentally passes a String gets a clear error
-        # from Dir.glob rather than iterating String characters.
-        dirs = Array(watch_dirs)
-        paths = dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }.sort.uniq
-        paths.each do |path|
-          # Read content before touching the digest: if the file vanishes between
-          # glob and read (TOCTOU), rescue before anything is mixed into the hash.
-          content = File.binread(path) rescue next
-          d << path << "\x00" << content << "\x00"
-        end
-        d.hexdigest
-      end
-      private_class_method :source_hash
-
       def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, watch_dirs: nil, **json_options)
         FileUtils.mkdir_p(cache_dir)
 
@@ -140,11 +268,10 @@ module GraphQL
 
         # Fast path: if watch_dirs is set, try to derive the merkle root purely from
         # the on-disk fingerprint file — no ensure_loaded, no type loading at all.
-        if (sdl = fast_path_cached_sdl(cache_dir, watch_dirs, options_key, ".json"))
-          return sdl
-        end
+        sdl, current_manifest = fast_path_cached_sdl(cache_dir, watch_dirs, options_key, ".json")
+        return sdl if sdl
 
-        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs)
+        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs, current_manifest: current_manifest)
         merkle_root = compute_merkle_root(fingerprints)
 
         cache_path = File.join(cache_dir, "schema_#{merkle_root}_#{options_key}.json")
@@ -164,11 +291,10 @@ module GraphQL
 
         # Fast path: if watch_dirs is set, try to derive the merkle root purely from
         # the on-disk fingerprint file — no ensure_loaded, no type loading at all.
-        if (sdl = fast_path_cached_sdl(cache_dir, watch_dirs, nil, ".graphql"))
-          return sdl
-        end
+        sdl, current_manifest = fast_path_cached_sdl(cache_dir, watch_dirs, nil, ".graphql")
+        return sdl if sdl
 
-        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs)
+        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs, current_manifest: current_manifest)
         types = fingerprints.keys
         merkle_root = compute_merkle_root(fingerprints)
 

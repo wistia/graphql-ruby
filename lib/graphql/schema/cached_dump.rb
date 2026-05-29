@@ -64,23 +64,20 @@ module GraphQL
         types = dumpable_types(schema)
         type_by_name = types.each_with_object({}) { |t, h| h[t.graphql_name] = t }
 
-        if old_manifest && old_fprints && old_manifest == current_manifest && old_fprints.size == types.size
+        if old_manifest && old_fprints && old_manifest == current_manifest
           # Nothing changed — trust all cached fingerprints
           fps = {}
           old_fprints.each do |name, entry|
             t = type_by_name[name]
             fps[t] = entry[:fp] if t
           end
-          if fps.size == types.size
-            persist_manifest_and_fingerprints(manifest_path, current_manifest, fprint_path, old_fprints)
-            return fps
-          end
+          return fps if fps.size == types.size
         end
 
         # Determine which files changed
         changed_files = changed_file_set(old_manifest, current_manifest)
 
-        if old_fprints && !changed_files.nil? && old_fprints.size == types.size
+        if old_fprints && !changed_files.nil?
           # Partial change strategy:
           # 1. Re-fingerprint only types whose source files changed (mapped types)
           # 2. If unmapped files changed, re-fingerprint all mapped types (concerns may have changed)
@@ -130,8 +127,9 @@ module GraphQL
           end
 
           # Phase 2: for sourceless types (connections/edges), trust cache unless
-          # a mapped type's fingerprint actually changed
-          if any_mapped_fp_changed
+          # a mapped type's fingerprint actually changed OR an unmapped file changed
+          # (unmapped files could be base classes that sourceless types inherit from)
+          if any_mapped_fp_changed || unmapped_changed
             recomputed_sourceless = compute_fingerprints(sourceless_types, parallel_workers: parallel_workers)
             fps.merge!(recomputed_sourceless)
           else
@@ -158,7 +156,7 @@ module GraphQL
 
       # Build a manifest of {path => content_sha256} for all .rb files in watch_dirs.
       def self.build_file_manifest(watch_dirs)
-        dirs = Array(watch_dirs)
+        dirs = Array(watch_dirs).map { |d| File.expand_path(d) }
         paths = dirs.flat_map { |dir| Dir.glob("#{dir}/**/*.rb") }.sort.uniq
         manifest = {}
         paths.each do |path|
@@ -200,14 +198,17 @@ module GraphQL
 
       def self.load_marshal(path)
         Marshal.load(File.binread(path))
-      rescue Errno::ENOENT, TypeError, ArgumentError, NameError
+      rescue Errno::ENOENT, TypeError, ArgumentError, NameError, EOFError, RangeError
         nil
       end
       private_class_method :load_marshal
 
       def self.persist_manifest_and_fingerprints(manifest_path, manifest, fprint_path, fprints)
-        atomic_write(manifest_path, Marshal.dump(manifest))
+        # Write fingerprints FIRST, then manifest. The manifest acts as the "commit"
+        # marker — if the process crashes between the two writes, the stale manifest
+        # will differ from the current source on the next run, triggering recomputation.
         atomic_write(fprint_path, Marshal.dump(fprints))
+        atomic_write(manifest_path, Marshal.dump(manifest))
       end
       private_class_method :persist_manifest_and_fingerprints
 
@@ -239,9 +240,9 @@ module GraphQL
         persisted = load_marshal(fprint_path)
         return [nil, current_manifest] unless persisted
 
-        merkle_root = Digest::SHA256.hexdigest(
-          persisted.sort_by { |name, _| name }.map { |name, entry| "#{name}:#{entry[:fp]}" }.join
-        )
+        d = Digest::SHA256.new
+        persisted.sort_by { |name, _| name }.each { |name, entry| d << name << ":" << entry[:fp] }
+        merkle_root = d.hexdigest
         if suffix_key
           cache_path = File.join(cache_dir, "schema_#{merkle_root}_#{suffix_key}#{extension}")
         else
@@ -255,9 +256,11 @@ module GraphQL
       private_class_method :fast_path_cached_sdl
 
       def self.compute_merkle_root(fingerprints)
-        Digest::SHA256.hexdigest(
-          fingerprints.sort_by { |t, _| t.graphql_name }.map { |t, fp| "#{t.graphql_name}:#{fp}" }.join
-        )
+        d = Digest::SHA256.new
+        fingerprints.sort_by { |t, _| t.graphql_name }.each do |t, fp|
+          d << t.graphql_name << ":" << fp
+        end
+        d.hexdigest
       end
       private_class_method :compute_merkle_root
 

@@ -27,17 +27,23 @@ module GraphQL
       # Minimum number of cache-miss nodes before we bother forking render workers.
       RENDER_FORK_THRESHOLD = 4
 
+      # Bounded to MAX_CACHE_ENTRIES to prevent memory leaks in long-lived processes
+      # (e.g., listen-based file watchers with Rails code reloading).
       FINGERPRINT_CACHE = {}
-      private_constant :FINGERPRINT_CACHE
+      MAX_CACHE_ENTRIES = 4
+      private_constant :FINGERPRINT_CACHE, :MAX_CACHE_ENTRIES
 
       def self.fingerprints_for(schema, parallel_workers: 1, cache_dir: DEFAULT_CACHE_DIR, watch_dirs: nil, current_manifest: nil)
         cache_key = [schema.object_id, cache_dir, watch_dirs&.sort]
-        FINGERPRINT_CACHE[cache_key] ||= compute_and_persist_fingerprints(schema,
-          parallel_workers: parallel_workers,
-          cache_dir: cache_dir,
-          watch_dirs: watch_dirs,
-          current_manifest: current_manifest
-        )
+        FINGERPRINT_CACHE[cache_key] ||= begin
+          FINGERPRINT_CACHE.shift while FINGERPRINT_CACHE.size >= MAX_CACHE_ENTRIES
+          compute_and_persist_fingerprints(schema,
+            parallel_workers: parallel_workers,
+            cache_dir: cache_dir,
+            watch_dirs: watch_dirs,
+            current_manifest: current_manifest
+          )
+        end
       end
       private_class_method :fingerprints_for
 
@@ -150,6 +156,9 @@ module GraphQL
         end
         persist_manifest_and_fingerprints(manifest_path, current_manifest, fprint_path, new_fprints)
 
+        # Clean up stale fragment files and old full-schema SDL files
+        gc_stale_files(cache_dir, new_fprints)
+
         fps
       end
       private_class_method :incremental_fingerprints
@@ -218,6 +227,36 @@ module GraphQL
         File.rename(tmp, path)
       end
       private_class_method :atomic_write
+
+      # Remove stale fragment files and old full-schema SDL/JSON files.
+      # Keeps only fragments referenced by current fingerprints and the most recent
+      # full-schema file. Runs after persisting new fingerprints (not on warm path).
+      def self.gc_stale_files(cache_dir, current_fprints)
+        types_dir = File.join(cache_dir, "types")
+        return unless Dir.exist?(types_dir)
+
+        # Build set of current fragment filenames
+        current_fragments = Set.new
+        current_fprints.each do |name, entry|
+          current_fragments << "#{name}_#{entry[:fp]}.sdl"
+        end
+
+        # Remove stale fragment files
+        Dir.foreach(types_dir) do |fname|
+          next if fname.start_with?(".")
+          next if current_fragments.include?(fname)
+          File.unlink(File.join(types_dir, fname)) rescue nil
+        end
+
+        # Remove old full-schema files (keep only the 2 most recent)
+        schema_files = Dir.glob(File.join(cache_dir, "schema_*")).sort_by { |f| File.mtime(f) rescue Time.at(0) }
+        if schema_files.size > 2
+          schema_files[0...-2].each { |f| File.unlink(f) rescue nil }
+        end
+      rescue Errno::ENOENT
+        # Cache dir may have been removed concurrently — not a problem
+      end
+      private_class_method :gc_stale_files
 
       def self.clear_cache
         FINGERPRINT_CACHE.clear

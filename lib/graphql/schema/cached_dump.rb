@@ -59,14 +59,18 @@ module GraphQL
 
       # Incremental fingerprinting: uses a per-file manifest to detect which files
       # changed, then re-fingerprints only types defined in those files.
-      # Persists: manifest.marshal ({path => sha256}), fingerprints.marshal ({name => {fp:, src:}})
+      # Persists: manifest.marshal ({path => sha256}), fingerprints.marshal ({name => {fp:, src:, deps: [...]}})
+      #
+      # The `deps` array contains source files of resolver classes attached to a type's
+      # fields. When a resolver file changes, only the type that owns that field is
+      # re-fingerprinted (not the entire schema).
       def self.incremental_fingerprints(schema, parallel_workers:, cache_dir:, watch_dirs:, current_manifest: nil)
         manifest_path = File.join(cache_dir, "manifest.marshal")
         fprint_path = File.join(cache_dir, "fingerprints.marshal")
 
         current_manifest ||= build_file_manifest(watch_dirs)
         old_manifest = load_marshal(manifest_path)
-        old_fprints = load_marshal(fprint_path)  # {name => {fp: "hex", src: "/path.rb"}}
+        old_fprints = load_marshal(fprint_path)  # {name => {fp: "hex", src: "/path.rb", deps: [...]}}
 
         types = dumpable_types(schema)
         type_by_name = types.each_with_object({}) { |t, h| h[t.graphql_name] = t }
@@ -85,17 +89,17 @@ module GraphQL
         changed_files = changed_file_set(old_manifest, current_manifest)
 
         if old_fprints && !changed_files.nil?
-          # Partial change strategy:
-          # 1. Re-fingerprint only types whose source files changed (mapped types)
-          # 2. If unmapped files changed, re-fingerprint all mapped types (concerns may have changed)
-          # 3. Trust cached fingerprints for auto-generated (sourceless) types UNLESS
-          #    a mapped type's fingerprint actually changed (which could affect connections/edges)
+          # Build the set of ALL files tracked by the fingerprint system:
+          # primary source files + resolver dependency files.
           mapped_files = Set.new
-          old_fprints.each_value { |entry| mapped_files << entry[:src] if entry[:src] }
+          old_fprints.each_value do |entry|
+            mapped_files << entry[:src] if entry[:src]
+            entry[:deps]&.each { |dep| mapped_files << dep }
+          end
 
           unmapped_changed = changed_files.any? { |f| !mapped_files.include?(f) }
 
-          # Phase 1: re-fingerprint mapped types whose source (or a concern) changed
+          # Phase 1: re-fingerprint types whose source OR dependency files changed
           mapped_types_to_recompute = []
           mapped_types_from_cache = []
           sourceless_types = []
@@ -107,6 +111,8 @@ module GraphQL
             elsif entry[:src].nil?
               sourceless_types << t
             elsif changed_files.include?(entry[:src])
+              mapped_types_to_recompute << t
+            elsif entry[:deps]&.any? { |dep| changed_files.include?(dep) }
               mapped_types_to_recompute << t
             elsif unmapped_changed
               mapped_types_to_recompute << t
@@ -149,11 +155,14 @@ module GraphQL
           fps = compute_fingerprints(types, parallel_workers: parallel_workers)
         end
 
-        # Persist manifest + fingerprints with source locations
+        # Persist manifest + fingerprints with source locations and resolver deps
         new_fprints = {}
         fps.each do |t, fp|
           src = type_source_file(t)
-          new_fprints[t.graphql_name] = { fp: fp, src: src }
+          deps = resolver_dep_files(t)
+          entry = { fp: fp, src: src }
+          entry[:deps] = deps unless deps.empty?
+          new_fprints[t.graphql_name] = entry
         end
         persist_manifest_and_fingerprints(manifest_path, current_manifest, fprint_path, new_fprints)
 
@@ -205,6 +214,26 @@ module GraphQL
         nil
       end
       private_class_method :type_source_file
+
+      # Get source files of resolver classes attached to this type's fields.
+      # These are "dependency" files: if a resolver file changes, the parent type
+      # needs re-fingerprinting because the resolver declares arguments and return
+      # types that appear in the parent type's SDL.
+      def self.resolver_dep_files(type)
+        return [] unless type.respond_to?(:all_field_definitions)
+        deps = Set.new
+        type.all_field_definitions.each do |field|
+          rc = field.instance_variable_get(:@resolver_class)
+          next unless rc
+          next unless rc.name
+          loc = Object.const_source_location(rc.name)
+          deps << loc.first if loc&.first
+        rescue NameError, TypeError
+          next
+        end
+        deps.to_a
+      end
+      private_class_method :resolver_dep_files
 
       # Sanitize a graphql_name for safe use in file paths.
       # GraphQL names should only contain [A-Za-z0-9_] per the spec,

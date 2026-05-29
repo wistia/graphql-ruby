@@ -11,11 +11,12 @@ module GraphQL
     # Merkle-tree fragment cache for schema SDL dumps.
     #
     # Each type gets a per-type content fingerprint computed from its name, fields,
-    # and arguments without resolving cross-type references (no ensure_loaded triggered).
+    # and arguments. Field metadata is loaded (field.ensure_loaded) but cross-type
+    # references are not resolved (field.type is never called).
     # The schema's cache key is the SHA256 of all sorted type fingerprints (Merkle root).
     #
     # Warm run (nothing changed): returns cached full SDL immediately — no Warden BFS,
-    # no ensure_loaded, no AST construction.
+    # no type loading, no AST construction.
     #
     # Partial change: re-fingerprints only types whose source files changed, trusts
     # cached fingerprints for the rest. Re-renders only types whose fingerprints changed.
@@ -216,6 +217,17 @@ module GraphQL
       end
       private_class_method :safe_type_filename
 
+      def self.validate_watch_dirs(watch_dirs)
+        return unless watch_dirs
+        Array(watch_dirs).each do |dir|
+          expanded = File.expand_path(dir)
+          unless Dir.exist?(expanded)
+            warn "GraphQL::Schema::CachedDump: watch_dir '#{dir}' does not exist (cache will be ineffective)"
+          end
+        end
+      end
+      private_class_method :validate_watch_dirs
+
       def self.load_marshal(path)
         Marshal.load(File.binread(path))
       rescue Errno::ENOENT, TypeError, ArgumentError, NameError, EOFError, RangeError
@@ -259,8 +271,9 @@ module GraphQL
           File.unlink(File.join(types_dir, fname)) rescue nil
         end
 
-        # Remove old full-schema files (keep only the 2 most recent)
-        schema_files = Dir.glob(File.join(cache_dir, "schema_*")).sort_by { |f| File.mtime(f) rescue Time.at(0) }
+        # Remove old full-schema files (keep only the 2 most recent).
+        # Use [mtime, filename] to break ties when files are written in rapid succession.
+        schema_files = Dir.glob(File.join(cache_dir, "schema_*")).sort_by { |f| [File.mtime(f), f] rescue [Time.at(0), f] }
         if schema_files.size > 2
           schema_files[0...-2].each { |f| File.unlink(f) rescue nil }
         end
@@ -321,6 +334,7 @@ module GraphQL
 
       def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, watch_dirs: nil, **json_options)
         FileUtils.mkdir_p(cache_dir)
+        validate_watch_dirs(watch_dirs)
 
         options_key = Digest::SHA256.hexdigest(json_options.sort.map(&:inspect).join)
 
@@ -346,6 +360,7 @@ module GraphQL
 
       def self.dump(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, watch_dirs: nil)
         FileUtils.mkdir_p(File.join(cache_dir, "types"))
+        validate_watch_dirs(watch_dirs)
 
         # Fast path: if watch_dirs is set, try to derive the merkle root purely from
         # the on-disk fingerprint file — no ensure_loaded, no type loading at all.
@@ -473,7 +488,7 @@ module GraphQL
         # fork(2) is unsafe in multi-threaded processes: mutexes held by other threads are
         # copied locked into the child with no owner, causing deadlocks. Fall back to serial
         # if more than one thread is live (e.g. Puma worker threads, AR connection pool).
-        if Thread.list.size > 1
+        if Thread.list.size > 1 || !Process.respond_to?(:fork)
           return types.each_with_object({}) { |type, h| h[type] = type_fingerprint(type) }
         end
 
@@ -537,7 +552,7 @@ module GraphQL
       # Returns a Hash[idx => sdl_string] for all entries in +misses+.
       # Each miss entry is [idx, node, type_name, fingerprint].
       def self.parallel_render_fragments(misses, cache_dir, num_workers)
-        if Thread.list.size > 1
+        if Thread.list.size > 1 || !Process.respond_to?(:fork)
           rendered = {}
           misses.each { |idx, node, type_name, fp| rendered[idx] = fragment_for_node(node, type_name, fp, GraphQL::Language::Printer.new, cache_dir) }
           return rendered
@@ -630,8 +645,12 @@ module GraphQL
       # Return a stable string for a raw type expression ivar (@return_type_expr / @type_expr).
       # When the ivar holds a Class/Module (already resolved), use .graphql_name which is stable
       # across processes. When it holds a String/Symbol/Array (unresolved expr), .to_s is fine.
+      # Procs produce unstable .to_s (contains memory address), so we call them to get the
+      # resolved value — this matches what graphql-ruby does internally during type resolution.
       def self.stable_type_expr(expr)
         case expr
+        when Proc
+          stable_type_expr(expr.call)
         when Module
           expr.respond_to?(:graphql_name) ? expr.graphql_name : expr.name.to_s
         when Array

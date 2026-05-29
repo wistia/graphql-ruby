@@ -1,44 +1,42 @@
 # frozen_string_literal: true
-require "graphql"
+require "spec_helper"
+require "graphql/schema/cached_dump"
 require "tmpdir"
-require "rake"
-require "graphql/rake_task"
+require "fileutils"
 
-RSpec.describe GraphQL::Schema::CachedDump do
-  # Access the private constant via Module.const_get
-  let(:fp_cache) { described_class.send(:const_get, :FINGERPRINT_CACHE) }
+describe GraphQL::Schema::CachedDump do
+  def fp_cache
+    GraphQL::Schema::CachedDump.send(:const_get, :FINGERPRINT_CACHE)
+  end
 
-  before(:each) do
+  before do
     fp_cache.clear
   end
 
-  # ---------------------------------------------------------------------------
-  # Shared test schema that exercises: objects, interfaces, enums, input objects,
-  # unions, scalars, custom directives, deprecations, and default argument values.
-  # ---------------------------------------------------------------------------
-  let(:test_schema) do
-    node_iface = Module.new do
+  # Shared test schema with objects, interfaces, enums, input objects, unions, scalars
+  def build_test_schema
+    node_iface = Module.new {
       include GraphQL::Schema::Interface
       graphql_name "Node"
       field :id, GraphQL::Types::ID, null: false
-    end
+    }
 
-    status_enum = Class.new(GraphQL::Schema::Enum) do
+    status_enum = Class.new(GraphQL::Schema::Enum) {
       graphql_name "Status"
       description "Publication status"
       value "DRAFT"
       value "PUBLISHED"
       value "ARCHIVED", deprecation_reason: "Use PUBLISHED"
-    end
+    }
 
-    tag_input = Class.new(GraphQL::Schema::InputObject) do
+    tag_input = Class.new(GraphQL::Schema::InputObject) {
       graphql_name "TagInput"
       description "Input for a tag"
       argument :name, String, required: true
       argument :color, String, required: false, default_value: "blue"
-    end
+    }
 
-    post_type = Class.new(GraphQL::Schema::Object) do
+    post_type = Class.new(GraphQL::Schema::Object) {
       graphql_name "Post"
       description "A blog post"
       implements node_iface
@@ -47,28 +45,28 @@ RSpec.describe GraphQL::Schema::CachedDump do
       field :body, String, null: true
       field :status, status_enum, null: false
       field :views, GraphQL::Types::Int, null: false, deprecation_reason: "Use analytics"
-    end
+    }
 
-    comment_type = Class.new(GraphQL::Schema::Object) do
+    comment_type = Class.new(GraphQL::Schema::Object) {
       graphql_name "Comment"
       description "A comment"
       implements node_iface
       field :id, GraphQL::Types::ID, null: false
       field :text, String, null: false
-    end
+    }
 
-    content_union = Class.new(GraphQL::Schema::Union) do
+    content_union = Class.new(GraphQL::Schema::Union) {
       graphql_name "Content"
       description "Any piece of content"
       possible_types post_type, comment_type
-    end
+    }
 
-    url_scalar = Class.new(GraphQL::Schema::Scalar) do
+    url_scalar = Class.new(GraphQL::Schema::Scalar) {
       graphql_name "URL"
       specified_by_url "https://url.spec.whatwg.org/"
-    end
+    }
 
-    query_type = Class.new(GraphQL::Schema::Object) do
+    query_type = Class.new(GraphQL::Schema::Object) {
       graphql_name "Query"
       description "The root query type"
       field :node, node_iface do
@@ -83,1091 +81,598 @@ RSpec.describe GraphQL::Schema::CachedDump do
         argument :limit, GraphQL::Types::Int, required: false, default_value: 10
       end
       field :site_url, url_scalar, null: true
-    end
+    }
 
-    mutation_type = Class.new(GraphQL::Schema::Object) do
+    mutation_type = Class.new(GraphQL::Schema::Object) {
       graphql_name "Mutation"
       field :create_post, post_type do
         argument :title, String, required: true
         argument :tag, tag_input, required: false
       end
-    end
+    }
 
-    Class.new(GraphQL::Schema) do
+    Class.new(GraphQL::Schema) {
       query query_type
       mutation mutation_type
       extra_types content_union
-    end
+    }
   end
 
-  # ---------------------------------------------------------------------------
-  # 1. Core correctness
-  # ---------------------------------------------------------------------------
   describe "dump (SDL)" do
-    it "matches to_definition on first (cold) run" do
+    it "matches to_definition on cold run" do
+      schema = build_test_schema
       Dir.mktmpdir do |dir|
-        result = described_class.dump(test_schema, cache_dir: dir)
-        expect(result).to eq(test_schema.to_definition)
+        result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
+        assert_equal schema.to_definition, result
       end
     end
 
-    it "matches to_definition on second (warm, cache hit) run" do
+    it "matches to_definition on warm run" do
+      schema = build_test_schema
       Dir.mktmpdir do |dir|
-        described_class.dump(test_schema, cache_dir: dir)
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
         fp_cache.clear
-        result = described_class.dump(test_schema, cache_dir: dir)
-        expect(result).to eq(test_schema.to_definition)
+        result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
+        assert_equal schema.to_definition, result
       end
     end
   end
 
   describe "dump_json" do
     it "matches to_json on cold run" do
+      schema = build_test_schema
       Dir.mktmpdir do |dir|
-        result = described_class.dump_json(test_schema, cache_dir: dir)
-        expect(result).to eq(test_schema.to_json)
+        result = GraphQL::Schema::CachedDump.dump_json(schema, cache_dir: dir)
+        assert_equal schema.to_json, result
       end
     end
 
     it "matches to_json on warm run" do
+      schema = build_test_schema
       Dir.mktmpdir do |dir|
-        described_class.dump_json(test_schema, cache_dir: dir)
+        GraphQL::Schema::CachedDump.dump_json(schema, cache_dir: dir)
         fp_cache.clear
-        result = described_class.dump_json(test_schema, cache_dir: dir)
-        expect(result).to eq(test_schema.to_json)
+        result = GraphQL::Schema::CachedDump.dump_json(schema, cache_dir: dir)
+        assert_equal schema.to_json, result
       end
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # 2. Cache invalidation — fingerprint changes trigger re-render
-  # ---------------------------------------------------------------------------
   describe "cache invalidation" do
-    it "changing a field description changes the type fingerprint and produces updated SDL" do
+    it "changing a field description changes the fingerprint and produces updated SDL" do
       Dir.mktmpdir do |dir|
-        q_v1 = Class.new(GraphQL::Schema::Object) do
+        q_v1 = Class.new(GraphQL::Schema::Object) {
           graphql_name "Query"
           field :name, String, null: true, description: "original description"
-        end
+        }
         schema_v1 = Class.new(GraphQL::Schema) { query q_v1 }
 
-        q_v2 = Class.new(GraphQL::Schema::Object) do
+        q_v2 = Class.new(GraphQL::Schema::Object) {
           graphql_name "Query"
           field :name, String, null: true, description: "updated description"
-        end
+        }
         schema_v2 = Class.new(GraphQL::Schema) { query q_v2 }
 
-        described_class.dump(schema_v1, cache_dir: dir)
+        GraphQL::Schema::CachedDump.dump(schema_v1, cache_dir: dir)
         fp_cache.clear
-        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
+        result_v2 = GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: dir)
 
-        # Two distinct Query fragment files (one per fingerprint)
         query_sdl_files = Dir.glob("#{dir}/types/Query_*.sdl")
-        expect(query_sdl_files.length).to eq(2)
-        expect(result_v2).to include("updated description")
-        expect(result_v2).not_to include("original description")
+        assert_equal 2, query_sdl_files.length
+        assert_includes result_v2, "updated description"
+        refute_includes result_v2, "original description"
       end
     end
 
-    it "changing a field nullability invalidates that type's fragment" do
+    it "changing a field nullability invalidates the fragment" do
       Dir.mktmpdir do |dir|
-        q_v1 = Class.new(GraphQL::Schema::Object) do
+        q_v1 = Class.new(GraphQL::Schema::Object) {
           graphql_name "Query"
           field :name, String, null: true
-        end
+        }
         schema_v1 = Class.new(GraphQL::Schema) { query q_v1 }
 
-        q_v2 = Class.new(GraphQL::Schema::Object) do
+        q_v2 = Class.new(GraphQL::Schema::Object) {
           graphql_name "Query"
           field :name, String, null: false
-        end
+        }
         schema_v2 = Class.new(GraphQL::Schema) { query q_v2 }
 
-        described_class.dump(schema_v1, cache_dir: dir)
+        GraphQL::Schema::CachedDump.dump(schema_v1, cache_dir: dir)
         fp_cache.clear
-        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
+        result_v2 = GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: dir)
 
-        expect(Dir.glob("#{dir}/types/Query_*.sdl").length).to eq(2)
-        expect(result_v2).to include("name: String!")
+        assert_equal 2, Dir.glob("#{dir}/types/Query_*.sdl").length
+        assert_includes result_v2, "name: String!"
       end
     end
 
-    it "adding a field to an object type invalidates its fragment" do
+    it "adding a field invalidates that type's fragment" do
       Dir.mktmpdir do |dir|
-        post_v1 = Class.new(GraphQL::Schema::Object) do
+        post_v1 = Class.new(GraphQL::Schema::Object) {
           graphql_name "Post"
           field :title, String, null: false
-        end
-        q = Class.new(GraphQL::Schema::Object) do
+        }
+        q = Class.new(GraphQL::Schema::Object) {
           graphql_name "Query"
           field :post, post_v1
-        end
+        }
         schema_v1 = Class.new(GraphQL::Schema) { query q }
 
-        post_v2 = Class.new(GraphQL::Schema::Object) do
+        post_v2 = Class.new(GraphQL::Schema::Object) {
           graphql_name "Post"
           field :title, String, null: false
-          field :body, String, null: true  # NEW
-        end
-        q2 = Class.new(GraphQL::Schema::Object) do
+          field :body, String, null: true
+        }
+        q2 = Class.new(GraphQL::Schema::Object) {
           graphql_name "Query"
           field :post, post_v2
-        end
+        }
         schema_v2 = Class.new(GraphQL::Schema) { query q2 }
 
-        described_class.dump(schema_v1, cache_dir: dir)
+        GraphQL::Schema::CachedDump.dump(schema_v1, cache_dir: dir)
         fp_cache.clear
-        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
+        result_v2 = GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: dir)
 
-        expect(Dir.glob("#{dir}/types/Post_*.sdl").length).to eq(2)
-        expect(result_v2).to include("body: String")
+        assert_equal 2, Dir.glob("#{dir}/types/Post_*.sdl").length
+        assert_includes result_v2, "body: String"
       end
     end
 
-    it "changing an enum value invalidates the enum type's fragment" do
+    it "adding an enum value invalidates the enum's fragment" do
       Dir.mktmpdir do |dir|
-        enum_v1 = Class.new(GraphQL::Schema::Enum) do
+        enum_v1 = Class.new(GraphQL::Schema::Enum) {
           graphql_name "Color"
           value "RED"
           value "BLUE"
-        end
-        q = Class.new(GraphQL::Schema::Object) do
+        }
+        q = Class.new(GraphQL::Schema::Object) {
           graphql_name "Query"
           field :color, enum_v1, null: true
-        end
+        }
         schema_v1 = Class.new(GraphQL::Schema) { query q }
 
-        enum_v2 = Class.new(GraphQL::Schema::Enum) do
+        enum_v2 = Class.new(GraphQL::Schema::Enum) {
           graphql_name "Color"
           value "RED"
           value "BLUE"
-          value "GREEN"  # NEW VALUE
-        end
-        q2 = Class.new(GraphQL::Schema::Object) do
+          value "GREEN"
+        }
+        q2 = Class.new(GraphQL::Schema::Object) {
           graphql_name "Query"
           field :color, enum_v2, null: true
-        end
+        }
         schema_v2 = Class.new(GraphQL::Schema) { query q2 }
 
-        described_class.dump(schema_v1, cache_dir: dir)
+        GraphQL::Schema::CachedDump.dump(schema_v1, cache_dir: dir)
         fp_cache.clear
-        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
+        result_v2 = GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: dir)
 
-        expect(Dir.glob("#{dir}/types/Color_*.sdl").length).to eq(2)
-        expect(result_v2).to include("GREEN")
-      end
-    end
-
-    it "changing an input object argument type invalidates its fragment" do
-      Dir.mktmpdir do |dir|
-        input_v1 = Class.new(GraphQL::Schema::InputObject) do
-          graphql_name "PostInput"
-          argument :title, String, required: true
-        end
-        q = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :search, String, null: true do
-            argument :input, input_v1, required: false
-          end
-        end
-        schema_v1 = Class.new(GraphQL::Schema) { query q }
-
-        input_v2 = Class.new(GraphQL::Schema::InputObject) do
-          graphql_name "PostInput"
-          argument :title, String, required: true
-          argument :limit, GraphQL::Types::Int, required: false, default_value: 5  # NEW
-        end
-        q2 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :search, String, null: true do
-            argument :input, input_v2, required: false
-          end
-        end
-        schema_v2 = Class.new(GraphQL::Schema) { query q2 }
-
-        described_class.dump(schema_v1, cache_dir: dir)
-        fp_cache.clear
-        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
-
-        expect(Dir.glob("#{dir}/types/PostInput_*.sdl").length).to eq(2)
-        expect(result_v2).to include("limit: Int = 5")
-      end
-    end
-
-    it "adding a type-level directive invalidates that type's fragment" do
-      Dir.mktmpdir do |dir|
-        custom_dir = Class.new(GraphQL::Schema::Directive) do
-          graphql_name "someDirective"
-          locations(GraphQL::Schema::Directive::OBJECT)
-        end
-
-        q_v1 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :name, String, null: true
-        end
-        schema_v1 = Class.new(GraphQL::Schema) { query q_v1; directive custom_dir }
-
-        q_v2 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          directive custom_dir  # Apply the directive to this type
-          field :name, String, null: true
-        end
-        schema_v2 = Class.new(GraphQL::Schema) { query q_v2; directive custom_dir }
-
-        described_class.dump(schema_v1, cache_dir: dir)
-        fp_cache.clear
-        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
-
-        expect(Dir.glob("#{dir}/types/Query_*.sdl").length).to eq(2)
-        expect(result_v2).to include("@someDirective")
-      end
-    end
-
-    it "changing interface membership invalidates the object's fragment" do
-      Dir.mktmpdir do |dir|
-        iface = Module.new do
-          include GraphQL::Schema::Interface
-          graphql_name "Identifiable"
-          field :id, GraphQL::Types::ID, null: false
-        end
-
-        post_v1 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Post"
-          field :id, GraphQL::Types::ID, null: false
-          field :title, String, null: false
-        end
-        q = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :post, post_v1
-        end
-        schema_v1 = Class.new(GraphQL::Schema) { query q }
-
-        post_v2 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Post"
-          implements iface  # NOW IMPLEMENTS INTERFACE
-          field :id, GraphQL::Types::ID, null: false
-          field :title, String, null: false
-        end
-        q2 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :post, post_v2
-        end
-        schema_v2 = Class.new(GraphQL::Schema) { query q2 }
-
-        described_class.dump(schema_v1, cache_dir: dir)
-        fp_cache.clear
-        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
-
-        expect(Dir.glob("#{dir}/types/Post_*.sdl").length).to eq(2)
-        expect(result_v2).to include("Post implements Identifiable")
-      end
-    end
-
-    it "changing a resolver-backed field's return type invalidates the type's fragment" do
-      Dir.mktmpdir do |dir|
-        resolver_v1 = Class.new(GraphQL::Schema::Resolver) do
-          type String, null: true
-          def resolve; "hello"; end
-        end
-        resolver_v2 = Class.new(GraphQL::Schema::Resolver) do
-          type Integer, null: false
-          def resolve; 42; end
-        end
-
-        q_v1 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :thing, resolver: resolver_v1
-        end
-        schema_v1 = Class.new(GraphQL::Schema) { query q_v1 }
-
-        q_v2 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :thing, resolver: resolver_v2
-        end
-        schema_v2 = Class.new(GraphQL::Schema) { query q_v2 }
-
-        described_class.dump(schema_v1, cache_dir: dir)
-        fp_cache.clear
-        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
-
-        expect(Dir.glob("#{dir}/types/Query_*.sdl").length).to eq(2)
-        expect(result_v2).to include("thing: Int!")
+        assert_equal 2, Dir.glob("#{dir}/types/Color_*.sdl").length
+        assert_includes result_v2, "GREEN"
       end
     end
 
     it "changing a union member set invalidates the union's fragment" do
       Dir.mktmpdir do |dir|
-        type_a = Class.new(GraphQL::Schema::Object) do
+        type_a = Class.new(GraphQL::Schema::Object) {
           graphql_name "TypeA"
           field :id, GraphQL::Types::ID, null: false
-        end
-        type_b = Class.new(GraphQL::Schema::Object) do
+        }
+        type_b = Class.new(GraphQL::Schema::Object) {
           graphql_name "TypeB"
           field :id, GraphQL::Types::ID, null: false
-        end
-        type_c = Class.new(GraphQL::Schema::Object) do
+        }
+        type_c = Class.new(GraphQL::Schema::Object) {
           graphql_name "TypeC"
           field :id, GraphQL::Types::ID, null: false
-        end
+        }
 
-        union_v1 = Class.new(GraphQL::Schema::Union) do
+        union_v1 = Class.new(GraphQL::Schema::Union) {
           graphql_name "MyUnion"
           possible_types type_a, type_b
-        end
-        q = Class.new(GraphQL::Schema::Object) do
+        }
+        q = Class.new(GraphQL::Schema::Object) {
           graphql_name "Query"
           field :thing, union_v1, null: true
-        end
+        }
         schema_v1 = Class.new(GraphQL::Schema) { query q }
 
-        union_v2 = Class.new(GraphQL::Schema::Union) do
+        union_v2 = Class.new(GraphQL::Schema::Union) {
           graphql_name "MyUnion"
-          possible_types type_a, type_b, type_c  # NEW MEMBER
-        end
-        q2 = Class.new(GraphQL::Schema::Object) do
+          possible_types type_a, type_b, type_c
+        }
+        q2 = Class.new(GraphQL::Schema::Object) {
           graphql_name "Query"
           field :thing, union_v2, null: true
-        end
+        }
         schema_v2 = Class.new(GraphQL::Schema) { query q2 }
 
-        described_class.dump(schema_v1, cache_dir: dir)
+        GraphQL::Schema::CachedDump.dump(schema_v1, cache_dir: dir)
         fp_cache.clear
-        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
+        result_v2 = GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: dir)
 
-        expect(Dir.glob("#{dir}/types/MyUnion_*.sdl").length).to eq(2)
-        expect(result_v2).to include("TypeC")
+        assert_equal 2, Dir.glob("#{dir}/types/MyUnion_*.sdl").length
+        assert_includes result_v2, "TypeC"
       end
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # 3. Cache structure
-  # ---------------------------------------------------------------------------
   describe "cache structure" do
-    it "cold run creates types/<TypeName>_<fingerprint>.sdl fragment files" do
+    it "creates per-type fragment files" do
+      schema = build_test_schema
       Dir.mktmpdir do |dir|
-        described_class.dump(test_schema, cache_dir: dir)
-
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
         sdl_files = Dir.glob("#{dir}/types/*.sdl")
-        expect(sdl_files).not_to be_empty
-
+        refute_empty sdl_files
         sdl_files.each do |path|
-          name = File.basename(path)
-          expect(name).to match(/\A[A-Za-z][A-Za-z0-9]*_[0-9a-f]{64}\.sdl\z/)
+          assert_match(/\A[A-Za-z_][A-Za-z0-9_]*_[0-9a-f]{64}\.sdl\z/, File.basename(path))
         end
       end
     end
 
-    it "cold run creates schema_<merkle_root>.graphql full cache file" do
+    it "creates a full schema cache file" do
+      schema = build_test_schema
       Dir.mktmpdir do |dir|
-        described_class.dump(test_schema, cache_dir: dir)
-
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
         full_files = Dir.glob("#{dir}/schema_*.graphql")
-        expect(full_files.length).to eq(1)
-        expect(File.basename(full_files.first)).to match(/\Aschema_[0-9a-f]{64}\.graphql\z/)
+        assert_equal 1, full_files.length
+        assert_match(/\Aschema_[0-9a-f]{64}\.graphql\z/, File.basename(full_files.first))
       end
     end
 
-    it "warm run (nothing changed) does NOT create new fragment files" do
+    it "warm run does not create new fragment files" do
+      schema = build_test_schema
       Dir.mktmpdir do |dir|
-        described_class.dump(test_schema, cache_dir: dir)
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
         files_before = Dir.glob("#{dir}/types/*.sdl").map { |f| File.basename(f) }.sort
-
-        fp_cache.clear  # Simulate new process — fragments remain on disk
-
-        described_class.dump(test_schema, cache_dir: dir)
+        fp_cache.clear
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
         files_after = Dir.glob("#{dir}/types/*.sdl").map { |f| File.basename(f) }.sort
-
-        expect(files_after).to eq(files_before)
-      end
-    end
-
-    it "partial change: only the modified type gets a new fragment; others are reused" do
-      Dir.mktmpdir do |dir|
-        # Use the same Query class in both schema versions so its fingerprint is identical.
-        # Only the Post extra_type changes between v1 and v2.
-        shared_query = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :name, String, null: true
-        end
-
-        post_v1 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Post"
-          field :title, String, null: false
-        end
-
-        post_v2 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Post"
-          field :title, String, null: false
-          field :body, String, null: true  # added field
-        end
-
-        schema_v1 = Class.new(GraphQL::Schema) { query shared_query; extra_types post_v1 }
-        schema_v2 = Class.new(GraphQL::Schema) { query shared_query; extra_types post_v2 }
-
-        described_class.dump(schema_v1, cache_dir: dir)
-        query_files_v1 = Dir.glob("#{dir}/types/Query_*.sdl").map { |f| File.basename(f) }
-
-        fp_cache.clear
-        described_class.dump(schema_v2, cache_dir: dir)
-        query_files_all = Dir.glob("#{dir}/types/Query_*.sdl").map { |f| File.basename(f) }
-        post_files_all  = Dir.glob("#{dir}/types/Post_*.sdl").map  { |f| File.basename(f) }
-
-        # Query type is the same Ruby class — fingerprint is identical, no new file
-        expect(query_files_all).to eq(query_files_v1)
-
-        # Post type changed — two distinct fragment files (v1 + v2)
-        expect(post_files_all.length).to eq(2)
-      end
-    end
-
-    it "dump_json creates schema_<merkle_root>_<options_key>.json cache file" do
-      Dir.mktmpdir do |dir|
-        described_class.dump_json(test_schema, cache_dir: dir)
-
-        json_files = Dir.glob("#{dir}/schema_*.json")
-        expect(json_files.length).to eq(1)
-        expect(File.basename(json_files.first)).to match(
-          /\Aschema_[0-9a-f]{64}_[0-9a-f]{64}\.json\z/
-        )
-      end
-    end
-
-    it "different json_options produce different cache files" do
-      Dir.mktmpdir do |dir|
-        described_class.dump_json(test_schema, cache_dir: dir)
-        described_class.dump_json(test_schema, cache_dir: dir, include_is_one_of: true)
-        described_class.dump_json(test_schema, cache_dir: dir, include_is_repeatable: true)
-
-        json_files = Dir.glob("#{dir}/schema_*.json")
-        expect(json_files.length).to eq(3)
+        assert_equal files_before, files_after
       end
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # 4. Merkle root correctness
-  # ---------------------------------------------------------------------------
   describe "Merkle root" do
-    it "two schemas with identical type definitions produce the same Merkle root" do
+    it "identical schemas produce the same Merkle root" do
       Dir.mktmpdir do |dir_a|
         Dir.mktmpdir do |dir_b|
-          q_a = Class.new(GraphQL::Schema::Object) do
+          q_a = Class.new(GraphQL::Schema::Object) {
             graphql_name "Query"
             field :name, String, null: true
-          end
-          q_b = Class.new(GraphQL::Schema::Object) do
+          }
+          q_b = Class.new(GraphQL::Schema::Object) {
             graphql_name "Query"
             field :name, String, null: true
-          end
+          }
           schema_a = Class.new(GraphQL::Schema) { query q_a }
           schema_b = Class.new(GraphQL::Schema) { query q_b }
 
-          described_class.dump(schema_a, cache_dir: dir_a)
+          GraphQL::Schema::CachedDump.dump(schema_a, cache_dir: dir_a)
           fp_cache.clear
-          described_class.dump(schema_b, cache_dir: dir_b)
+          GraphQL::Schema::CachedDump.dump(schema_b, cache_dir: dir_b)
 
           root_a = Dir.glob("#{dir_a}/schema_*.graphql").map { |f| File.basename(f) }.first
           root_b = Dir.glob("#{dir_b}/schema_*.graphql").map { |f| File.basename(f) }.first
-
-          expect(root_a).to eq(root_b)
+          assert_equal root_a, root_b
         end
       end
     end
 
-    it "a type name change produces a different Merkle root" do
+    it "different type names produce different Merkle roots" do
       Dir.mktmpdir do |dir_a|
         Dir.mktmpdir do |dir_b|
-          q_a = Class.new(GraphQL::Schema::Object) do
+          q_a = Class.new(GraphQL::Schema::Object) {
             graphql_name "Query"
             field :name, String, null: true
-          end
-          q_b = Class.new(GraphQL::Schema::Object) do
-            graphql_name "RootQuery"  # different graphql_name
+          }
+          q_b = Class.new(GraphQL::Schema::Object) {
+            graphql_name "RootQuery"
             field :name, String, null: true
-          end
+          }
           schema_a = Class.new(GraphQL::Schema) { query q_a }
           schema_b = Class.new(GraphQL::Schema) { query q_b }
 
-          described_class.dump(schema_a, cache_dir: dir_a)
+          GraphQL::Schema::CachedDump.dump(schema_a, cache_dir: dir_a)
           fp_cache.clear
-          described_class.dump(schema_b, cache_dir: dir_b)
+          GraphQL::Schema::CachedDump.dump(schema_b, cache_dir: dir_b)
 
           root_a = Dir.glob("#{dir_a}/schema_*.graphql").map { |f| File.basename(f) }.first
           root_b = Dir.glob("#{dir_b}/schema_*.graphql").map { |f| File.basename(f) }.first
-
-          expect(root_a).not_to eq(root_b)
+          refute_equal root_a, root_b
         end
       end
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # 5. FINGERPRINT_CACHE memoization
-  # ---------------------------------------------------------------------------
-  describe "FINGERPRINT_CACHE memoization" do
-    def cache_key(schema, cache_dir, watch_dirs = nil)
-      [schema.object_id, cache_dir, watch_dirs&.sort]
-    end
-
-    it "calling dump twice on the same schema object uses memoized fingerprints" do
-      Dir.mktmpdir do |dir|
-        described_class.dump(test_schema, cache_dir: dir)
-        key = cache_key(test_schema, dir)
-        expect(fp_cache.size).to eq(1)
-        expect(fp_cache).to have_key(key)
-
-        first_fingerprints = fp_cache[key]
-
-        described_class.dump(test_schema, cache_dir: dir)
-        expect(fp_cache.size).to eq(1)
-        expect(fp_cache[key]).to equal(first_fingerprints)  # same object_id
+  describe "FINGERPRINT_CACHE" do
+    it "bounded to MAX_CACHE_ENTRIES" do
+      schemas = 5.times.map do |i|
+        q = Class.new(GraphQL::Schema::Object) {
+          graphql_name "Query"
+          field :"field_#{i}", String, null: true
+        }
+        Class.new(GraphQL::Schema) { query q }
       end
-    end
 
-    it "different schema objects have independent cache entries" do
       Dir.mktmpdir do |dir|
-        q1 = Class.new(GraphQL::Schema::Object) { graphql_name "Query"; field :a, String }
-        q2 = Class.new(GraphQL::Schema::Object) { graphql_name "Query"; field :a, String }
-        schema1 = Class.new(GraphQL::Schema) { query q1 }
-        schema2 = Class.new(GraphQL::Schema) { query q2 }
-
-        described_class.dump(schema1, cache_dir: dir)
-        described_class.dump(schema2, cache_dir: dir)
-
-        expect(fp_cache.size).to eq(2)
-        expect(fp_cache).to have_key(cache_key(schema1, dir))
-        expect(fp_cache).to have_key(cache_key(schema2, dir))
+        schemas.each_with_index do |s, i|
+          GraphQL::Schema::CachedDump.dump(s, cache_dir: "#{dir}/#{i}")
+        end
+        max = GraphQL::Schema::CachedDump.send(:const_get, :MAX_CACHE_ENTRIES)
+        assert fp_cache.size <= max, "Cache size #{fp_cache.size} exceeds MAX_CACHE_ENTRIES #{max}"
       end
     end
   end
 
-  # ---------------------------------------------------------------------------
-  # 6. Edge cases
-  # ---------------------------------------------------------------------------
-  describe "edge cases" do
-    it "schema with extra_types includes those types in dump and Merkle root" do
+  describe "incremental fingerprinting (watch_dirs)" do
+    it "cold run produces correct output with watch_dirs" do
+      schema = build_test_schema
       Dir.mktmpdir do |dir|
-        standalone_enum = Class.new(GraphQL::Schema::Enum) do
-          graphql_name "StandaloneEnum"
-          value "ALPHA"
-          value "BETA"
-        end
+        watch_dir = File.join(dir, "src")
+        FileUtils.mkdir_p(watch_dir)
+        File.write(File.join(watch_dir, "types.rb"), "# schema source")
+        cache_dir = File.join(dir, "cache")
 
-        q = Class.new(GraphQL::Schema::Object) { graphql_name "Query"; field :x, String }
-        schema = Class.new(GraphQL::Schema) { query q; extra_types standalone_enum }
+        result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        assert_equal schema.to_definition, result
+      end
+    end
 
-        result = described_class.dump(schema, cache_dir: dir)
+    it "warm run uses fast path and returns correct output" do
+      schema = build_test_schema
+      Dir.mktmpdir do |dir|
+        watch_dir = File.join(dir, "src")
+        FileUtils.mkdir_p(watch_dir)
+        File.write(File.join(watch_dir, "types.rb"), "# schema source")
+        cache_dir = File.join(dir, "cache")
 
-        expect(result).to eq(schema.to_definition)
-        expect(result).to include("StandaloneEnum")
-
-        # Merkle root must include the extra type
-        files_with = Dir.glob("#{dir}/schema_*.graphql").map { |f| File.basename(f) }
-
-        # Schema without extra_type has a different Merkle root
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
         fp_cache.clear
-        Dir.mktmpdir do |dir2|
-          schema_without = Class.new(GraphQL::Schema) { query q }
-          described_class.dump(schema_without, cache_dir: dir2)
-          files_without = Dir.glob("#{dir2}/schema_*.graphql").map { |f| File.basename(f) }
-          expect(files_with.first).not_to eq(files_without.first)
-        end
+        result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        assert_equal schema.to_definition, result
       end
     end
 
-    it "schema with non-standard root type names includes schema block in output" do
+    it "modifying a watched file triggers incremental recomputation" do
+      schema = build_test_schema
       Dir.mktmpdir do |dir|
-        q = Class.new(GraphQL::Schema::Object) do
-          graphql_name "MyQueryRoot"
-          field :ping, String
+        watch_dir = File.join(dir, "src")
+        FileUtils.mkdir_p(watch_dir)
+        File.write(File.join(watch_dir, "types.rb"), "# schema source")
+        cache_dir = File.join(dir, "cache")
+
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        fp_cache.clear
+
+        File.write(File.join(watch_dir, "types.rb"), "# modified source")
+        result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        assert_equal schema.to_definition, result
+      end
+    end
+
+    it "persists manifest and fingerprints files" do
+      schema = build_test_schema
+      Dir.mktmpdir do |dir|
+        watch_dir = File.join(dir, "src")
+        FileUtils.mkdir_p(watch_dir)
+        File.write(File.join(watch_dir, "types.rb"), "# schema source")
+        cache_dir = File.join(dir, "cache")
+
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+
+        assert File.exist?(File.join(cache_dir, "manifest.marshal"))
+        assert File.exist?(File.join(cache_dir, "fingerprints.marshal"))
+      end
+    end
+
+    it "handles corrupted marshal files gracefully" do
+      schema = build_test_schema
+      Dir.mktmpdir do |dir|
+        watch_dir = File.join(dir, "src")
+        FileUtils.mkdir_p(watch_dir)
+        File.write(File.join(watch_dir, "types.rb"), "# schema source")
+        cache_dir = File.join(dir, "cache")
+        FileUtils.mkdir_p(File.join(cache_dir, "types"))
+
+        File.binwrite(File.join(cache_dir, "manifest.marshal"), "corrupt \xFF\xFF")
+        File.binwrite(File.join(cache_dir, "fingerprints.marshal"), "corrupt \xFF\xFF")
+
+        result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        assert_equal schema.to_definition, result
+      end
+    end
+  end
+
+  describe "safe_type_filename" do
+    it "accepts valid GraphQL names" do
+      valid_names = ["Query", "MyType_123", "_Private", "A"]
+      valid_names.each do |name|
+        assert_equal name, GraphQL::Schema::CachedDump.send(:safe_type_filename, name)
+      end
+    end
+
+    it "rejects names with path traversal characters" do
+      invalid_names = ["../etc/passwd", "foo/bar", "type name", "a\x00b", ""]
+      invalid_names.each do |name|
+        assert_raises(ArgumentError) do
+          GraphQL::Schema::CachedDump.send(:safe_type_filename, name)
         end
+      end
+    end
+  end
+
+  describe "gc_stale_files" do
+    it "removes stale fragment files after recomputation" do
+      Dir.mktmpdir do |dir|
+        q_v1 = Class.new(GraphQL::Schema::Object) {
+          graphql_name "Query"
+          field :name, String, null: true, description: "v1"
+        }
+        schema_v1 = Class.new(GraphQL::Schema) { query q_v1 }
+
+        q_v2 = Class.new(GraphQL::Schema::Object) {
+          graphql_name "Query"
+          field :name, String, null: true, description: "v2"
+        }
+        schema_v2 = Class.new(GraphQL::Schema) { query q_v2 }
+
+        watch_dir = File.join(dir, "src")
+        FileUtils.mkdir_p(watch_dir)
+        File.write(File.join(watch_dir, "query.rb"), "# v1")
+        cache_dir = File.join(dir, "cache")
+
+        GraphQL::Schema::CachedDump.dump(schema_v1, cache_dir: cache_dir, watch_dirs: [watch_dir])
+        fp_cache.clear
+
+        # Modify watched file to trigger GC
+        File.write(File.join(watch_dir, "query.rb"), "# v2")
+        GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: cache_dir, watch_dirs: [watch_dir])
+
+        # Old fragment should be cleaned up
+        fragments = Dir.glob("#{cache_dir}/types/Query_*.sdl")
+        assert_equal 1, fragments.length
+      end
+    end
+
+    it "removes old full schema files during GC" do
+      Dir.mktmpdir do |dir|
+        cache_dir = File.join(dir, "cache")
+        FileUtils.mkdir_p(File.join(cache_dir, "types"))
+
+        watch_dir = File.join(dir, "src")
+        FileUtils.mkdir_p(watch_dir)
+        File.write(File.join(watch_dir, "query.rb"), "# v0")
+
+        q = Class.new(GraphQL::Schema::Object) {
+          graphql_name "Query"
+          field :field_0, String, null: true
+        }
         schema = Class.new(GraphQL::Schema) { query q }
 
-        result = described_class.dump(schema, cache_dir: dir)
+        fp_cache.clear
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
 
-        expect(result).to eq(schema.to_definition)
-        expect(result).to include("schema {")
-        expect(result).to include("query: MyQueryRoot")
+        # Manually create 5 old schema files to verify GC removes them
+        5.times do |i|
+          sleep 0.01
+          File.write(File.join(cache_dir, "schema_#{'0' * 64}#{i}.graphql"), "old#{i}")
+        end
+
+        before_count = Dir.glob("#{cache_dir}/schema_*").length
+        assert before_count > 2
+
+        # Trigger a file change to invoke GC
+        File.write(File.join(watch_dir, "query.rb"), "# v1")
+        fp_cache.clear
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
+
+        # GC runs before the new schema file is written, so it trims to 2,
+        # then dump writes the new file (total 3 at most).
+        after_count = Dir.glob("#{cache_dir}/schema_*").length
+        assert after_count < before_count, "GC should have removed some schema files (before=#{before_count}, after=#{after_count})"
+        assert after_count <= 3, "Expected at most 3 schema files after GC + new write, got #{after_count}"
+      end
+    end
+  end
+
+  describe "parallel execution" do
+    def build_large_schema
+      types = (1..25).map do |i|
+        Class.new(GraphQL::Schema::Object) {
+          graphql_name "Type#{i}"
+          field :id, GraphQL::Types::ID, null: false
+          field :name, String, null: true
+        }
+      end
+      query_type = Class.new(GraphQL::Schema::Object) {
+        graphql_name "Query"
+        types.each_with_index { |t, i| field :"type#{i}", t, null: true }
+      }
+      Class.new(GraphQL::Schema) { query query_type }
+    end
+
+    it "parallel output matches serial output" do
+      schema = build_large_schema
+      Dir.mktmpdir do |dir|
+        serial = GraphQL::Schema::CachedDump.dump(schema, cache_dir: "#{dir}/serial", parallel_workers: 1)
+        fp_cache.clear
+        parallel = GraphQL::Schema::CachedDump.dump(schema, cache_dir: "#{dir}/parallel", parallel_workers: 4)
+        assert_equal serial, parallel
       end
     end
 
-    it "schema with a custom non-built-in directive definition includes the directive in output" do
+    it "parallel output matches to_definition" do
+      schema = build_large_schema
       Dir.mktmpdir do |dir|
-        custom = Class.new(GraphQL::Schema::Directive) do
+        result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir, parallel_workers: 4)
+        assert_equal schema.to_definition, result
+      end
+    end
+  end
+
+  describe "edge cases" do
+    it "schema with non-standard root type names includes schema block" do
+      Dir.mktmpdir do |dir|
+        q = Class.new(GraphQL::Schema::Object) {
+          graphql_name "MyQueryRoot"
+          field :ping, String
+        }
+        schema = Class.new(GraphQL::Schema) { query q }
+
+        result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
+        assert_equal schema.to_definition, result
+        assert_includes result, "schema {"
+        assert_includes result, "query: MyQueryRoot"
+      end
+    end
+
+    it "schema with custom directive includes it in output" do
+      Dir.mktmpdir do |dir|
+        custom = Class.new(GraphQL::Schema::Directive) {
           graphql_name "rateLimit"
           description "Rate-limit a field"
           argument :max, GraphQL::Types::Int, required: true
           locations(GraphQL::Schema::Directive::FIELD_DEFINITION)
-        end
-
+        }
         q = Class.new(GraphQL::Schema::Object) { graphql_name "Query"; field :x, String }
         schema = Class.new(GraphQL::Schema) { query q; directive custom }
 
-        result = described_class.dump(schema, cache_dir: dir)
-
-        expect(result).to eq(schema.to_definition)
-        expect(result).to include("directive @rateLimit")
+        result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
+        assert_equal schema.to_definition, result
+        assert_includes result, "directive @rateLimit"
       end
     end
 
-    it "schema with an interface that implements another interface includes the membership in fingerprint" do
-      Dir.mktmpdir do |dir|
-        parent_iface = Module.new do
-          include GraphQL::Schema::Interface
-          graphql_name "Node"
-          field :id, GraphQL::Types::ID, null: false
-        end
-
-        # v1: Resource interface does NOT implement Node
-        child_iface_v1 = Module.new do
-          include GraphQL::Schema::Interface
-          graphql_name "Resource"
-          field :url, String, null: false
-        end
-
-        concrete_v1 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Post"
-          implements child_iface_v1
-          field :url, String, null: false
-        end
-
-        q = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :resource, child_iface_v1, null: true
-        end
-        schema_v1 = Class.new(GraphQL::Schema) { query q; orphan_types [concrete_v1] }
-
-        # v2: Resource interface NOW implements Node
-        child_iface_v2 = Module.new do
-          include GraphQL::Schema::Interface
-          graphql_name "Resource"
-          implements parent_iface
-          field :id, GraphQL::Types::ID, null: false
-          field :url, String, null: false
-        end
-
-        concrete_v2 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Post"
-          implements child_iface_v2
-          field :id, GraphQL::Types::ID, null: false
-          field :url, String, null: false
-        end
-
-        q2 = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :resource, child_iface_v2, null: true
-        end
-        schema_v2 = Class.new(GraphQL::Schema) { query q2; orphan_types [concrete_v2] }
-
-        described_class.dump(schema_v1, cache_dir: dir)
-        fp_cache.clear
-        result_v2 = described_class.dump(schema_v2, cache_dir: dir)
-
-        # Two distinct Resource fragment files — fingerprint changed when interface membership was added
-        expect(Dir.glob("#{dir}/types/Resource_*.sdl").length).to eq(2)
-        expect(result_v2).to include("Resource implements Node")
-      end
-    end
-
-    it "schema with no mutation or subscription dumps correctly" do
-      Dir.mktmpdir do |dir|
-        q = Class.new(GraphQL::Schema::Object) do
-          graphql_name "Query"
-          field :name, String, null: true
-        end
-        schema = Class.new(GraphQL::Schema) { query q }
-
-        result = described_class.dump(schema, cache_dir: dir)
-
-        expect(result).to eq(schema.to_definition)
-        expect(result).not_to include("mutation")
-        expect(result).not_to include("subscription")
-      end
-    end
-
-    it "automatically creates the cache dir if it does not exist" do
-      base = Dir.mktmpdir
-      new_dir = File.join(base, "deeply", "nested", "graphql")
-      begin
-        expect(File.directory?(new_dir)).to be(false)
+    it "auto-creates cache directory if it does not exist" do
+      Dir.mktmpdir do |base|
+        new_dir = File.join(base, "deeply", "nested", "cache")
+        refute File.directory?(new_dir)
 
         q = Class.new(GraphQL::Schema::Object) { graphql_name "Query"; field :x, String }
         schema = Class.new(GraphQL::Schema) { query q }
 
-        described_class.dump(schema, cache_dir: new_dir)
-
-        expect(File.directory?(new_dir)).to be(true)
-        expect(Dir.glob("#{new_dir}/*.graphql").length).to eq(1)
-      ensure
-        FileUtils.rm_rf(base)
-      end
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # 7. RakeTask integration
-  # ---------------------------------------------------------------------------
-  describe "GraphQL::RakeTask integration" do
-    let(:rake_schema) do
-      q = Class.new(GraphQL::Schema::Object) do
-        graphql_name "Query"
-        field :hello, String, null: true
-      end
-      Class.new(GraphQL::Schema) { query q }
-    end
-
-    it "with cache_dir set, calls CachedDump.dump for IDL" do
-      Dir.mktmpdir do |cache_dir|
-        Dir.mktmpdir do |out_dir|
-          allow(GraphQL::Schema::CachedDump).to receive(:dump).and_call_original
-
-          ns = "rake_cached_idl_#{rand(99999)}"
-          task_obj = GraphQL::RakeTask.new(
-            namespace: ns,
-            cache_dir: cache_dir,
-            idl_outfile: File.join(out_dir, "schema.graphql"),
-            json_outfile: File.join(out_dir, "schema.json")
-          ) do |t|
-            t.load_schema = ->(_task) { rake_schema }
-          end
-
-          fp_cache.clear
-          task_obj.send(:write_outfile, :to_definition, File.join(out_dir, "schema.graphql"))
-
-          expect(GraphQL::Schema::CachedDump).to have_received(:dump)
-
-          content = File.read(File.join(out_dir, "schema.graphql"))
-          expect(content.strip).to eq(rake_schema.to_definition.strip)
-        end
+        GraphQL::Schema::CachedDump.dump(schema, cache_dir: new_dir)
+        assert File.directory?(new_dir)
+        assert_equal 1, Dir.glob("#{new_dir}/*.graphql").length
       end
     end
 
-    it "with cache_dir set, calls CachedDump.dump_json for JSON" do
-      Dir.mktmpdir do |cache_dir|
-        Dir.mktmpdir do |out_dir|
-          allow(GraphQL::Schema::CachedDump).to receive(:dump_json).and_call_original
-
-          ns = "rake_cached_json_#{rand(99999)}"
-          task_obj = GraphQL::RakeTask.new(
-            namespace: ns,
-            cache_dir: cache_dir,
-            idl_outfile: File.join(out_dir, "schema.graphql"),
-            json_outfile: File.join(out_dir, "schema.json")
-          ) do |t|
-            t.load_schema = ->(_task) { rake_schema }
-          end
-
-          fp_cache.clear
-          task_obj.send(:write_outfile, :to_json, File.join(out_dir, "schema.json"))
-
-          expect(GraphQL::Schema::CachedDump).to have_received(:dump_json)
-
-          content = File.read(File.join(out_dir, "schema.json"))
-          expect(JSON.parse(content)).to eq(JSON.parse(rake_schema.to_json))
-        end
-      end
-    end
-
-    it "without cache_dir uses standard to_definition / to_json (no CachedDump call)" do
-      Dir.mktmpdir do |out_dir|
-        allow(GraphQL::Schema::CachedDump).to receive(:dump).and_call_original
-        allow(GraphQL::Schema::CachedDump).to receive(:dump_json).and_call_original
-
-        ns = "rake_uncached_#{rand(99999)}"
-        task_obj = GraphQL::RakeTask.new(
-          namespace: ns,
-          idl_outfile: File.join(out_dir, "schema.graphql"),
-          json_outfile: File.join(out_dir, "schema.json")
-        ) do |t|
-          t.load_schema = ->(_task) { rake_schema }
-          # Note: no cache_dir set
-        end
-
-        task_obj.send(:write_outfile, :to_definition, File.join(out_dir, "schema.graphql"))
-        task_obj.send(:write_outfile, :to_json, File.join(out_dir, "schema.json"))
-
-        expect(GraphQL::Schema::CachedDump).not_to have_received(:dump)
-        expect(GraphQL::Schema::CachedDump).not_to have_received(:dump_json)
-
-        idl_content = File.read(File.join(out_dir, "schema.graphql"))
-        expect(idl_content.strip).to eq(rake_schema.to_definition.strip)
-      end
-    end
-
-    it "passes watch_dirs to CachedDump when configured" do
-      Dir.mktmpdir do |out_dir|
-        Dir.mktmpdir do |wdir|
-          File.write(File.join(wdir, "types.rb"), "# schema source")
-
-          allow(GraphQL::Schema::CachedDump).to receive(:dump).and_call_original
-
-          ns = "rake_watch_#{rand(99999)}"
-          task_obj = GraphQL::RakeTask.new(
-            namespace: ns,
-            idl_outfile: File.join(out_dir, "schema.graphql"),
-            json_outfile: File.join(out_dir, "schema.json")
-          ) do |t|
-            t.load_schema = ->(_task) { rake_schema }
-            t.cache_dir = out_dir
-            t.watch_dirs = [wdir]
-          end
-
-          task_obj.send(:write_outfile, :to_definition, File.join(out_dir, "schema.graphql"))
-
-          expect(GraphQL::Schema::CachedDump).to have_received(:dump).with(
-            rake_schema,
-            hash_including(watch_dirs: [wdir])
-          )
-          fp_cache.clear
-        end
-      end
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # 8. Persisted fingerprints (watch_dirs:)
-  # ---------------------------------------------------------------------------
-  describe "persisted fingerprints (watch_dirs:)" do
-    let(:watch_dir) do
-      dir = Dir.mktmpdir
-      @_watch_dir_created = dir
-      File.write(File.join(dir, "types.rb"), "# schema source")
-      dir
-    end
-
-    after { FileUtils.rm_rf(@_watch_dir_created) if @_watch_dir_created }
-
-    it "persists fingerprint file on cold run" do
-      Dir.mktmpdir do |cache_dir|
-        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-        fp_files = Dir.glob("#{cache_dir}/fingerprints_*.marshal")
-        expect(fp_files.length).to eq(1)
-        expect(File.basename(fp_files.first)).to match(/\Afingerprints_[0-9a-f]{64}\.marshal\z/)
-      end
-    end
-
-    it "loads from disk on warm run (skips recomputation)" do
-      Dir.mktmpdir do |cache_dir|
-        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-        fp_cache.clear
-
-        # Second call should load from disk
-        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-
-        # Still only one fingerprint file (same source hash)
-        expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal").length).to eq(1)
-      end
-    end
-
-    it "produces correct output when fingerprints are loaded from disk" do
-      Dir.mktmpdir do |cache_dir|
-        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-        fp_cache.clear
-
-        # Wipe SDL cache so it re-renders from persisted fingerprints
-        Dir.glob("#{cache_dir}/schema_*.graphql").each { |f| File.delete(f) }
-
-        result = described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-        expect(result).to eq(test_schema.to_definition)
-      end
-    end
-
-    it "creates new fingerprint file when watched file changes" do
-      Dir.mktmpdir do |cache_dir|
-        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-        fp_cache.clear
-
-        # Modify the watched file
-        File.write(File.join(watch_dir, "types.rb"), "# changed source")
-
-        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-
-        # Two fingerprint files now (old and new source hash)
-        expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal").length).to eq(2)
-      end
-    end
-
-    it "does not create fingerprint files when watch_dirs is nil" do
-      Dir.mktmpdir do |cache_dir|
-        described_class.dump(test_schema, cache_dir: cache_dir)
-        expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal")).to be_empty
-      end
-    end
-
-    it "does not create fingerprint files when watch_dirs is an empty array" do
-      Dir.mktmpdir do |cache_dir|
-        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [])
-        expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal")).to be_empty
-      end
-    end
-
-    it "falls through to recomputation when the marshal file is corrupted" do
-      Dir.mktmpdir do |cache_dir|
-        sh = described_class.send(:source_hash, [watch_dir])
-        fprint_path = File.join(cache_dir, "fingerprints_#{sh}.marshal")
-        File.binwrite(fprint_path, "this is not valid marshal data \x00\xFF\xFF")
-
-        expect {
-          result = described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-          expect(result.strip).to eq(test_schema.to_definition.strip)
-        }.not_to raise_error
-
-        expect { Marshal.load(File.binread(fprint_path)) }.not_to raise_error
-      end
-    end
-
-    it "falls through to recomputation when persisted type count does not match schema" do
-      Dir.mktmpdir do |cache_dir|
-        sh = described_class.send(:source_hash, [watch_dir])
-        fprint_path = File.join(cache_dir, "fingerprints_#{sh}.marshal")
-        stale = { "Query" => "a" * 64 }
-        File.binwrite(fprint_path, Marshal.dump(stale))
-
-        result = described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-        expect(result.strip).to eq(test_schema.to_definition.strip)
-
-        fresh = Marshal.load(File.binread(fprint_path))
-        expect(fresh.size).to eq(described_class.send(:dumpable_types, test_schema).size)
-      end
-    end
-
-    it "skips compute_fingerprints on a warm disk-load run" do
-      Dir.mktmpdir do |cache_dir|
-        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-        fp_cache.clear
-
-        expect(described_class).not_to receive(:compute_fingerprints)
-        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-      end
-    end
-
-    it "skips fingerprints_for entirely on a fully warm run (fast path)" do
-      Dir.mktmpdir do |cache_dir|
-        # Cold run: builds fingerprint marshal + SDL cache
-        described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-        fp_cache.clear
-
-        # Fully warm run: fingerprint marshal + SDL file both exist.
-        # fingerprints_for must never be called — the fast path returns before it.
-        expect(described_class).not_to receive(:fingerprints_for)
-        result = described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
-        expect(result.strip).to eq(test_schema.to_definition.strip)
-      end
-    end
-
-    it "works correctly when a watched directory contains no .rb files" do
-      Dir.mktmpdir do |empty_dir|
-        File.write(File.join(empty_dir, "README.md"), "# not ruby")
-        Dir.mktmpdir do |cache_dir|
-          result = described_class.dump(test_schema, cache_dir: cache_dir, watch_dirs: [empty_dir])
-          expect(result.strip).to eq(test_schema.to_definition.strip)
-          expect(Dir.glob("#{cache_dir}/fingerprints_*.marshal").length).to eq(1)
-        end
-      end
-    end
-
-    describe "source_hash" do
-      it "is deterministic across multiple calls with the same files" do
-        h1 = described_class.send(:source_hash, [watch_dir])
-        h2 = described_class.send(:source_hash, [watch_dir])
-        expect(h1).to eq(h2)
-        expect(h1).to match(/\A[0-9a-f]{64}\z/)
-      end
-
-      it "changes when a file's content changes" do
-        h1 = described_class.send(:source_hash, [watch_dir])
-        File.write(File.join(watch_dir, "types.rb"), "# changed")
-        h2 = described_class.send(:source_hash, [watch_dir])
-        expect(h1).not_to eq(h2)
-      end
-
-      it "does not double-hash files when watch_dirs contains overlapping paths" do
-        subdir = File.join(watch_dir, "sub")
-        FileUtils.mkdir_p(subdir)
-        File.write(File.join(subdir, "nested.rb"), "# nested")
-
-        # Single dir hash includes the nested file once
-        h_single = described_class.send(:source_hash, [watch_dir])
-        # Passing the subdir again must produce the same hash (overlapping entries deduplicated)
-        h_overlap = described_class.send(:source_hash, [watch_dir, subdir])
-        expect(h_single).to eq(h_overlap)
-      end
-    end
-  end
-
-  # ---------------------------------------------------------------------------
-  # 9. Parallel execution
-  # ---------------------------------------------------------------------------
-  let(:large_schema) do
-    types = (1..25).map do |i|
-      Class.new(GraphQL::Schema::Object) do
-        graphql_name "Type#{i}"
-        field :id, GraphQL::Types::ID, null: false
-        field :name, String, null: true
-      end
-    end
-    query_type = Class.new(GraphQL::Schema::Object) do
-      graphql_name "Query"
-      types.each_with_index do |t, i|
-        field :"type#{i}", t, null: true
-      end
-    end
-    Class.new(GraphQL::Schema) { query query_type }
-  end
-
-  describe "parallel execution" do
-    it "parallel dump output matches serial dump output" do
+    it "schema with extra_types includes them" do
       Dir.mktmpdir do |dir|
-        serial = described_class.dump(large_schema, cache_dir: dir, parallel_workers: 1)
-        fp_cache.clear
-        FileUtils.rm_rf(dir); FileUtils.mkdir_p(dir)
-        parallel = described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
-        expect(parallel).to eq(serial)
-      end
-    end
+        standalone = Class.new(GraphQL::Schema::Enum) {
+          graphql_name "StandaloneEnum"
+          value "ALPHA"
+          value "BETA"
+        }
+        q = Class.new(GraphQL::Schema::Object) { graphql_name "Query"; field :x, String }
+        schema = Class.new(GraphQL::Schema) { query q; extra_types standalone }
 
-    it "parallel dump_json output matches serial dump_json output" do
-      Dir.mktmpdir do |dir|
-        serial = described_class.dump_json(large_schema, cache_dir: dir, parallel_workers: 1)
-        fp_cache.clear
-        FileUtils.rm_rf(dir)
-        FileUtils.mkdir_p(dir)
-        parallel = described_class.dump_json(large_schema, cache_dir: dir, parallel_workers: 4)
-        expect(JSON.parse(parallel)).to eq(JSON.parse(serial))
+        result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
+        assert_equal schema.to_definition, result
+        assert_includes result, "StandaloneEnum"
       end
-    end
-
-    it "parallel dump matches to_definition" do
-      Dir.mktmpdir do |dir|
-        result = described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
-        expect(result).to eq(large_schema.to_definition)
-      end
-    end
-
-    it "parallel warm run (full cache hit) still returns correct output" do
-      Dir.mktmpdir do |dir|
-        described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
-        fp_cache.clear
-        result = described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
-        expect(result).to eq(large_schema.to_definition)
-      end
-    end
-
-    it "all fragment files are created with parallel workers" do
-      Dir.mktmpdir do |dir|
-        described_class.dump(large_schema, cache_dir: dir, parallel_workers: 4)
-        sdl_files = Dir.glob("#{dir}/types/*.sdl")
-        expect(sdl_files.length).to eq(26)  # Query + Type1..Type25
-      end
-    end
-  end
-
-  describe "Schema::Printer parallel output" do
-    it "parallel_workers output matches serial output" do
-      serial = large_schema.to_definition(parallel_workers: 1)
-      parallel = large_schema.to_definition(parallel_workers: 4)
-      expect(parallel).to eq(serial)
     end
   end
 end

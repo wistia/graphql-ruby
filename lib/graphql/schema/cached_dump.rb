@@ -34,7 +34,7 @@ module GraphQL
       private_constant :FINGERPRINT_CACHE, :MAX_CACHE_ENTRIES
 
       def self.fingerprints_for(schema, parallel_workers: 1, cache_dir: DEFAULT_CACHE_DIR, watch_dirs: nil, current_manifest: nil)
-        cache_key = [schema.object_id, cache_dir, watch_dirs&.sort]
+        cache_key = [schema.name || schema.object_id, cache_dir, watch_dirs&.sort]
         FINGERPRINT_CACHE[cache_key] ||= begin
           FINGERPRINT_CACHE.shift while FINGERPRINT_CACHE.size >= MAX_CACHE_ENTRIES
           compute_and_persist_fingerprints(schema,
@@ -205,6 +205,17 @@ module GraphQL
       end
       private_class_method :type_source_file
 
+      # Sanitize a graphql_name for safe use in file paths.
+      # GraphQL names should only contain [A-Za-z0-9_] per the spec,
+      # but we defensively reject anything else to prevent path traversal.
+      def self.safe_type_filename(name)
+        unless name.match?(/\A[A-Za-z_][A-Za-z0-9_]*\z/)
+          raise ArgumentError, "CachedDump: unsafe graphql_name for cache filename: #{name.inspect}"
+        end
+        name
+      end
+      private_class_method :safe_type_filename
+
       def self.load_marshal(path)
         Marshal.load(File.binread(path))
       rescue Errno::ENOENT, TypeError, ArgumentError, NameError, EOFError, RangeError
@@ -278,6 +289,11 @@ module GraphQL
 
         persisted = load_marshal(fprint_path)
         return [nil, current_manifest] unless persisted
+
+        # Re-check manifest hasn't been overwritten by a concurrent process between
+        # reading old_manifest and reading fingerprints (TOCTOU protection).
+        recheck = load_marshal(manifest_path)
+        return [nil, current_manifest] unless recheck && recheck == old_manifest
 
         d = Digest::SHA256.new
         persisted.sort_by { |name, _| name }.each { |name, entry| d << name << ":" << entry[:fp] }
@@ -372,7 +388,7 @@ module GraphQL
           type = type_map[node.name]
           if type
             fp = fingerprints[type]
-            frag_path = File.join(cache_dir, "types", "#{type.graphql_name}_#{fp}.sdl")
+            frag_path = File.join(cache_dir, "types", "#{safe_type_filename(type.graphql_name)}_#{fp}.sdl")
             begin
               hits[idx] = File.read(frag_path, encoding: Encoding::UTF_8)
             rescue Errno::ENOENT
@@ -539,7 +555,7 @@ module GraphQL
                 lang_printer = GraphQL::Language::Printer.new
                 batch_result = {}
                 batch.each do |idx, node, type_name, fp|
-                  frag_path = File.join(cache_dir, "types", "#{type_name}_#{fp}.sdl")
+                  frag_path = File.join(cache_dir, "types", "#{safe_type_filename(type_name)}_#{fp}.sdl")
                   # Another process may have already written this fragment — check first.
                   begin
                     sdl = File.read(frag_path, encoding: Encoding::UTF_8)
@@ -744,7 +760,7 @@ module GraphQL
       private_class_method :worker_exit_description
 
       def self.fragment_for_node(node, type_name, fingerprint, printer, cache_dir)
-        frag_path = File.join(cache_dir, "types", "#{type_name}_#{fingerprint}.sdl")
+        frag_path = File.join(cache_dir, "types", "#{safe_type_filename(type_name)}_#{fingerprint}.sdl")
         cached = File.read(frag_path, encoding: Encoding::UTF_8) rescue nil
         return cached if cached
 

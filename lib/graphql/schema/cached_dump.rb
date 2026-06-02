@@ -31,20 +31,30 @@ module GraphQL
       # Bounded to MAX_CACHE_ENTRIES to prevent memory leaks in long-lived processes
       # (e.g., listen-based file watchers with Rails code reloading).
       FINGERPRINT_CACHE = {}
+      FINGERPRINT_CACHE_MUTEX = Mutex.new
       MAX_CACHE_ENTRIES = 4
-      private_constant :FINGERPRINT_CACHE, :MAX_CACHE_ENTRIES
+      private_constant :FINGERPRINT_CACHE, :FINGERPRINT_CACHE_MUTEX, :MAX_CACHE_ENTRIES
 
       def self.fingerprints_for(schema, parallel_workers: 1, cache_dir: DEFAULT_CACHE_DIR, watch_dirs: nil, current_manifest: nil)
         cache_key = [schema.name || schema.object_id, cache_dir, watch_dirs&.sort]
-        FINGERPRINT_CACHE[cache_key] ||= begin
-          FINGERPRINT_CACHE.shift while FINGERPRINT_CACHE.size >= MAX_CACHE_ENTRIES
-          compute_and_persist_fingerprints(schema,
+        # Check under lock first (fast path for warm cache).
+        result = FINGERPRINT_CACHE_MUTEX.synchronize { FINGERPRINT_CACHE[cache_key] }
+        result ||= begin
+          computed = compute_and_persist_fingerprints(schema,
             parallel_workers: parallel_workers,
             cache_dir: cache_dir,
             watch_dirs: watch_dirs,
             current_manifest: current_manifest
           )
+          FINGERPRINT_CACHE_MUTEX.synchronize do
+            # Another thread may have raced and filled the entry — prefer the cached value
+            # so both threads return the same object, but either result is valid.
+            FINGERPRINT_CACHE[cache_key] ||= computed
+            FINGERPRINT_CACHE.shift while FINGERPRINT_CACHE.size > MAX_CACHE_ENTRIES
+            FINGERPRINT_CACHE[cache_key]
+          end
         end
+        result
       end
       private_class_method :fingerprints_for
 
@@ -300,9 +310,11 @@ module GraphQL
           File.unlink(File.join(types_dir, fname)) rescue nil
         end
 
-        # Remove old full-schema files (keep only the 2 most recent).
+        # Remove old full-schema SDL files (keep only the 2 most recent).
+        # Use schema_*.graphql so we don't accidentally delete JSON files written by
+        # dump_json (interleaved dump()/dump_json() calls must not evict each other).
         # Use [mtime, filename] to break ties when files are written in rapid succession.
-        schema_files = Dir.glob(File.join(cache_dir, "schema_*")).sort_by { |f| [File.mtime(f), f] rescue [Time.at(0), f] }
+        schema_files = Dir.glob(File.join(cache_dir, "schema_*.graphql")).sort_by { |f| [File.mtime(f), f] rescue [Time.at(0), f] }
         if schema_files.size > 2
           schema_files[0...-2].each { |f| File.unlink(f) rescue nil }
         end
@@ -312,8 +324,16 @@ module GraphQL
       private_class_method :gc_stale_files
 
       def self.clear_cache
-        FINGERPRINT_CACHE.clear
+        FINGERPRINT_CACHE_MUTEX.synchronize { FINGERPRINT_CACHE.clear }
       end
+
+      # Derive a schema-specific subdirectory so multiple schemas sharing the same
+      # top-level cache_dir cannot read each other's manifest/fingerprints/fragments.
+      def self.schema_cache_dir(schema, cache_dir)
+        safe_name = schema.name.to_s.gsub("::", "__").gsub(/[^A-Za-z0-9_-]/, "_")
+        File.join(cache_dir, safe_name)
+      end
+      private_class_method :schema_cache_dir
 
       # Attempt to return a cached SDL file without loading any schema types.
       # Checks the file manifest for changes — if no files changed since the last run,
@@ -362,20 +382,21 @@ module GraphQL
       private_class_method :compute_merkle_root
 
       def self.dump_json(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, watch_dirs: nil, **json_options)
-        FileUtils.mkdir_p(cache_dir)
+        effective_dir = schema_cache_dir(schema, cache_dir)
+        FileUtils.mkdir_p(effective_dir)
         validate_watch_dirs(watch_dirs)
 
         options_key = Digest::SHA256.hexdigest(json_options.sort.map(&:inspect).join)
 
         # Fast path: if watch_dirs is set, try to derive the merkle root purely from
         # the on-disk fingerprint file — no ensure_loaded, no type loading at all.
-        sdl, current_manifest = fast_path_cached_sdl(cache_dir, watch_dirs, options_key, ".json")
+        sdl, current_manifest = fast_path_cached_sdl(effective_dir, watch_dirs, options_key, ".json")
         return sdl if sdl
 
-        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs, current_manifest: current_manifest)
+        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: effective_dir, watch_dirs: watch_dirs, current_manifest: current_manifest)
         merkle_root = compute_merkle_root(fingerprints)
 
-        cache_path = File.join(cache_dir, "schema_#{merkle_root}_#{options_key}.json")
+        cache_path = File.join(effective_dir, "schema_#{merkle_root}_#{options_key}.json")
         cached = File.read(cache_path, encoding: Encoding::UTF_8) rescue nil
         return cached if cached
 
@@ -388,19 +409,20 @@ module GraphQL
       end
 
       def self.dump(schema, context: nil, cache_dir: DEFAULT_CACHE_DIR, parallel_workers: [Etc.nprocessors, 8].min, watch_dirs: nil)
-        FileUtils.mkdir_p(File.join(cache_dir, "types"))
+        effective_dir = schema_cache_dir(schema, cache_dir)
+        FileUtils.mkdir_p(File.join(effective_dir, "types"))
         validate_watch_dirs(watch_dirs)
 
         # Fast path: if watch_dirs is set, try to derive the merkle root purely from
         # the on-disk fingerprint file — no ensure_loaded, no type loading at all.
-        sdl, current_manifest = fast_path_cached_sdl(cache_dir, watch_dirs, nil, ".graphql")
+        sdl, current_manifest = fast_path_cached_sdl(effective_dir, watch_dirs, nil, ".graphql")
         return sdl if sdl
 
-        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: cache_dir, watch_dirs: watch_dirs, current_manifest: current_manifest)
+        fingerprints = fingerprints_for(schema, parallel_workers: parallel_workers, cache_dir: effective_dir, watch_dirs: watch_dirs, current_manifest: current_manifest)
         types = fingerprints.keys
         merkle_root = compute_merkle_root(fingerprints)
 
-        full_cache_path = File.join(cache_dir, "schema_#{merkle_root}.graphql")
+        full_cache_path = File.join(effective_dir, "schema_#{merkle_root}.graphql")
         cached = File.read(full_cache_path, encoding: Encoding::UTF_8) rescue nil
         return cached if cached
 
@@ -432,7 +454,7 @@ module GraphQL
           type = type_map[node.name]
           if type
             fp = fingerprints[type]
-            frag_path = File.join(cache_dir, "types", "#{safe_type_filename(type.graphql_name)}_#{fp}.sdl")
+            frag_path = File.join(effective_dir, "types", "#{safe_type_filename(type.graphql_name)}_#{fp}.sdl")
             begin
               hits[idx] = File.read(frag_path, encoding: Encoding::UTF_8)
             rescue Errno::ENOENT
@@ -447,11 +469,11 @@ module GraphQL
 
         # Render cache misses — parallel if there are enough of them.
         if misses.size >= RENDER_FORK_THRESHOLD && parallel_workers > 1
-          rendered_misses = parallel_render_fragments(misses, cache_dir, parallel_workers)
+          rendered_misses = parallel_render_fragments(misses, effective_dir, parallel_workers)
         else
           rendered_misses = {}
           misses.each do |idx, node, type_name, fp|
-            rendered_misses[idx] = fragment_for_node(node, type_name, fp, printer, cache_dir)
+            rendered_misses[idx] = fragment_for_node(node, type_name, fp, printer, effective_dir)
           end
         end
 
@@ -524,10 +546,11 @@ module GraphQL
         batches = partition_into_batches(types, num_workers)
         results_by_name = {}
 
-        workers = batches.map do |batch|
-          rd, wr = IO.pipe
-          pid = begin
-            fork do
+        workers = []
+        begin
+          batches.each do |batch|
+            rd, wr = IO.pipe
+            pid = fork do
               rd.close
               begin
                 result = {}
@@ -540,33 +563,37 @@ module GraphQL
                 exit!(0)
               end
             end
-          rescue
             wr.close
-            raise
+            workers << { pid: pid, rd: rd }
           end
-          wr.close
-          { pid: pid, rd: rd }
-        end
 
-        first_error = nil
-        workers.each do |w|
-          tmp_path = w[:rd].read
-          w[:rd].close
-          _pid, status = Process.waitpid2(w[:pid])
-          begin
-            # Only raise if the worker produced no path — a SIGKILL after the path was
-            # written still delivers valid results, so check tmp_path first.
-            if tmp_path.empty?
-              raise "CachedDump: fingerprint worker (pid #{w[:pid]}) produced no result: #{worker_exit_description(status)}"
+          first_error = nil
+          workers.each do |w|
+            tmp_path = w[:rd].read
+            w[:rd].close
+            _pid, status = Process.waitpid2(w[:pid])
+            w[:reaped] = true
+            begin
+              # Only raise if the worker produced no path — a SIGKILL after the path was
+              # written still delivers valid results, so check tmp_path first.
+              if tmp_path.empty?
+                raise "CachedDump: fingerprint worker (pid #{w[:pid]}) produced no result: #{worker_exit_description(status)}"
+              end
+              Marshal.load(File.binread(tmp_path)).each { |name, fp| results_by_name[name] = fp }
+            rescue => e
+              first_error ||= e
+            ensure
+              File.unlink(tmp_path) rescue nil
             end
-            Marshal.load(File.binread(tmp_path)).each { |name, fp| results_by_name[name] = fp }
-          rescue => e
-            first_error ||= e
-          ensure
-            File.unlink(tmp_path) rescue nil
+          end
+          raise first_error if first_error
+        ensure
+          workers.each do |w|
+            w[:rd].close rescue nil
+            next if w[:reaped]
+            begin; Process.waitpid2(w[:pid], Process::WNOHANG); rescue Errno::ECHILD, Errno::ESRCH; end
           end
         end
-        raise first_error if first_error
 
         # Rebuild the Hash keyed by type object (not name) to match non-parallel shape.
         type_by_name = types.each_with_object({}) { |t, h| h[t.graphql_name] = t }
@@ -590,10 +617,11 @@ module GraphQL
         batches = partition_into_batches(misses, num_workers)
         results = {}
 
-        workers = batches.map do |batch|
-          rd, wr = IO.pipe
-          pid = begin
-            fork do
+        workers = []
+        begin
+          batches.each do |batch|
+            rd, wr = IO.pipe
+            pid = fork do
               rd.close
               begin
                 lang_printer = GraphQL::Language::Printer.new
@@ -619,31 +647,35 @@ module GraphQL
                 exit!(0)
               end
             end
-          rescue
             wr.close
-            raise
+            workers << { pid: pid, rd: rd }
           end
-          wr.close
-          { pid: pid, rd: rd }
-        end
 
-        first_error = nil
-        workers.each do |w|
-          tmp_path = w[:rd].read
-          w[:rd].close
-          _pid, status = Process.waitpid2(w[:pid])
-          begin
-            if tmp_path.empty?
-              raise "CachedDump: render worker (pid #{w[:pid]}) produced no result: #{worker_exit_description(status)}"
+          first_error = nil
+          workers.each do |w|
+            tmp_path = w[:rd].read
+            w[:rd].close
+            _pid, status = Process.waitpid2(w[:pid])
+            w[:reaped] = true
+            begin
+              if tmp_path.empty?
+                raise "CachedDump: render worker (pid #{w[:pid]}) produced no result: #{worker_exit_description(status)}"
+              end
+              Marshal.load(File.binread(tmp_path)).each { |idx, sdl| results[idx] = sdl }
+            rescue => e
+              first_error ||= e
+            ensure
+              File.unlink(tmp_path) rescue nil
             end
-            Marshal.load(File.binread(tmp_path)).each { |idx, sdl| results[idx] = sdl }
-          rescue => e
-            first_error ||= e
-          ensure
-            File.unlink(tmp_path) rescue nil
+          end
+          raise first_error if first_error
+        ensure
+          workers.each do |w|
+            w[:rd].close rescue nil
+            next if w[:reaped]
+            begin; Process.waitpid2(w[:pid], Process::WNOHANG); rescue Errno::ECHILD, Errno::ESRCH; end
           end
         end
-        raise first_error if first_error
 
         results
       end

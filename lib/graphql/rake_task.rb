@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+require "digest/sha2"
 require "etc"
 require "fileutils"
 require "rake"
@@ -121,6 +122,17 @@ module GraphQL
     # Use the provided `method_name` to generate a string from the specified schema
     # then write it to `file`.
     def write_outfile(method_name, file)
+      if @cache_dir && @watch_dirs && !@watch_dirs.empty?
+        result = try_fast_path(method_name)
+        if result
+          dir = File.dirname(file)
+          FileUtils.mkdir_p(dir)
+          result += "\n" unless result.end_with?("\n")
+          File.write(file, result)
+          return
+        end
+      end
+
       schema = @load_schema.call(self)
       context = @load_context.call(self)
       result = case method_name
@@ -152,6 +164,23 @@ module GraphQL
         result += "\n"
       end
       File.write(file, result)
+    end
+
+    def try_fast_path(method_name)
+      extension = method_name == :to_json ? ".json" : ".graphql"
+      suffix_key = if method_name == :to_json
+        json_options = {
+          include_is_one_of: include_is_one_of,
+          include_deprecated_args: include_deprecated_args,
+          include_is_repeatable: include_is_repeatable,
+          include_specified_by_url: include_specified_by_url,
+          include_schema_description: include_schema_description,
+        }
+        Digest::SHA256.hexdigest(json_options.sort.map(&:inspect).join)
+      end
+      require "graphql/schema/cached_dump"
+      sdl, _ = GraphQL::Schema::CachedDump.send(:fast_path_cached_sdl, @cache_dir, @watch_dirs, suffix_key, extension)
+      sdl
     end
 
     def idl_path

@@ -9,6 +9,11 @@ describe GraphQL::Schema::CachedDump do
     GraphQL::Schema::CachedDump.send(:const_get, :FINGERPRINT_CACHE)
   end
 
+  # Return the effective (schema-specific) cache subdirectory for a given schema+cache_dir.
+  def effective_dir(schema, cache_dir)
+    GraphQL::Schema::CachedDump.send(:schema_cache_dir, schema, cache_dir)
+  end
+
   before do
     fp_cache.clear
   end
@@ -157,7 +162,7 @@ describe GraphQL::Schema::CachedDump do
         fp_cache.clear
         result_v2 = GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: dir)
 
-        query_sdl_files = Dir.glob("#{dir}/types/Query_*.sdl")
+        query_sdl_files = Dir.glob("#{effective_dir(schema_v2, dir)}/types/Query_*.sdl")
         assert_equal 2, query_sdl_files.length
         assert_includes result_v2, "updated description"
         refute_includes result_v2, "original description"
@@ -182,7 +187,7 @@ describe GraphQL::Schema::CachedDump do
         fp_cache.clear
         result_v2 = GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: dir)
 
-        assert_equal 2, Dir.glob("#{dir}/types/Query_*.sdl").length
+        assert_equal 2, Dir.glob("#{effective_dir(schema_v2, dir)}/types/Query_*.sdl").length
         assert_includes result_v2, "name: String!"
       end
     end
@@ -214,7 +219,7 @@ describe GraphQL::Schema::CachedDump do
         fp_cache.clear
         result_v2 = GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: dir)
 
-        assert_equal 2, Dir.glob("#{dir}/types/Post_*.sdl").length
+        assert_equal 2, Dir.glob("#{effective_dir(schema_v2, dir)}/types/Post_*.sdl").length
         assert_includes result_v2, "body: String"
       end
     end
@@ -248,7 +253,7 @@ describe GraphQL::Schema::CachedDump do
         fp_cache.clear
         result_v2 = GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: dir)
 
-        assert_equal 2, Dir.glob("#{dir}/types/Color_*.sdl").length
+        assert_equal 2, Dir.glob("#{effective_dir(schema_v2, dir)}/types/Color_*.sdl").length
         assert_includes result_v2, "GREEN"
       end
     end
@@ -292,7 +297,7 @@ describe GraphQL::Schema::CachedDump do
         fp_cache.clear
         result_v2 = GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: dir)
 
-        assert_equal 2, Dir.glob("#{dir}/types/MyUnion_*.sdl").length
+        assert_equal 2, Dir.glob("#{effective_dir(schema_v2, dir)}/types/MyUnion_*.sdl").length
         assert_includes result_v2, "TypeC"
       end
     end
@@ -303,7 +308,8 @@ describe GraphQL::Schema::CachedDump do
       schema = build_test_schema
       Dir.mktmpdir do |dir|
         GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
-        sdl_files = Dir.glob("#{dir}/types/*.sdl")
+        eff = effective_dir(schema, dir)
+        sdl_files = Dir.glob("#{eff}/types/*.sdl")
         refute_empty sdl_files
         sdl_files.each do |path|
           assert_match(/\A[A-Za-z_][A-Za-z0-9_]*_[0-9a-f]{64}\.sdl\z/, File.basename(path))
@@ -315,7 +321,8 @@ describe GraphQL::Schema::CachedDump do
       schema = build_test_schema
       Dir.mktmpdir do |dir|
         GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
-        full_files = Dir.glob("#{dir}/schema_*.graphql")
+        eff = effective_dir(schema, dir)
+        full_files = Dir.glob("#{eff}/schema_*.graphql")
         assert_equal 1, full_files.length
         assert_match(/\Aschema_[0-9a-f]{64}\.graphql\z/, File.basename(full_files.first))
       end
@@ -325,10 +332,11 @@ describe GraphQL::Schema::CachedDump do
       schema = build_test_schema
       Dir.mktmpdir do |dir|
         GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
-        files_before = Dir.glob("#{dir}/types/*.sdl").map { |f| File.basename(f) }.sort
+        eff = effective_dir(schema, dir)
+        files_before = Dir.glob("#{eff}/types/*.sdl").map { |f| File.basename(f) }.sort
         fp_cache.clear
         GraphQL::Schema::CachedDump.dump(schema, cache_dir: dir)
-        files_after = Dir.glob("#{dir}/types/*.sdl").map { |f| File.basename(f) }.sort
+        files_after = Dir.glob("#{eff}/types/*.sdl").map { |f| File.basename(f) }.sort
         assert_equal files_before, files_after
       end
     end
@@ -353,8 +361,8 @@ describe GraphQL::Schema::CachedDump do
           fp_cache.clear
           GraphQL::Schema::CachedDump.dump(schema_b, cache_dir: dir_b)
 
-          root_a = Dir.glob("#{dir_a}/schema_*.graphql").map { |f| File.basename(f) }.first
-          root_b = Dir.glob("#{dir_b}/schema_*.graphql").map { |f| File.basename(f) }.first
+          root_a = Dir.glob("#{effective_dir(schema_a, dir_a)}/schema_*.graphql").map { |f| File.basename(f) }.first
+          root_b = Dir.glob("#{effective_dir(schema_b, dir_b)}/schema_*.graphql").map { |f| File.basename(f) }.first
           assert_equal root_a, root_b
         end
       end
@@ -378,8 +386,8 @@ describe GraphQL::Schema::CachedDump do
           fp_cache.clear
           GraphQL::Schema::CachedDump.dump(schema_b, cache_dir: dir_b)
 
-          root_a = Dir.glob("#{dir_a}/schema_*.graphql").map { |f| File.basename(f) }.first
-          root_b = Dir.glob("#{dir_b}/schema_*.graphql").map { |f| File.basename(f) }.first
+          root_a = Dir.glob("#{effective_dir(schema_a, dir_a)}/schema_*.graphql").map { |f| File.basename(f) }.first
+          root_b = Dir.glob("#{effective_dir(schema_b, dir_b)}/schema_*.graphql").map { |f| File.basename(f) }.first
           refute_equal root_a, root_b
         end
       end
@@ -462,8 +470,9 @@ describe GraphQL::Schema::CachedDump do
 
         GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
 
-        assert File.exist?(File.join(cache_dir, "manifest.marshal"))
-        assert File.exist?(File.join(cache_dir, "fingerprints.marshal"))
+        eff = effective_dir(schema, cache_dir)
+        assert File.exist?(File.join(eff, "manifest.marshal"))
+        assert File.exist?(File.join(eff, "fingerprints.marshal"))
       end
     end
 
@@ -474,10 +483,11 @@ describe GraphQL::Schema::CachedDump do
         FileUtils.mkdir_p(watch_dir)
         File.write(File.join(watch_dir, "types.rb"), "# schema source")
         cache_dir = File.join(dir, "cache")
-        FileUtils.mkdir_p(File.join(cache_dir, "types"))
+        eff = effective_dir(schema, cache_dir)
+        FileUtils.mkdir_p(File.join(eff, "types"))
 
-        File.binwrite(File.join(cache_dir, "manifest.marshal"), "corrupt \xFF\xFF")
-        File.binwrite(File.join(cache_dir, "fingerprints.marshal"), "corrupt \xFF\xFF")
+        File.binwrite(File.join(eff, "manifest.marshal"), "corrupt \xFF\xFF")
+        File.binwrite(File.join(eff, "fingerprints.marshal"), "corrupt \xFF\xFF")
 
         result = GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
         assert_equal schema.to_definition, result
@@ -530,8 +540,9 @@ describe GraphQL::Schema::CachedDump do
         File.write(File.join(watch_dir, "query.rb"), "# v2")
         GraphQL::Schema::CachedDump.dump(schema_v2, cache_dir: cache_dir, watch_dirs: [watch_dir])
 
-        # Old fragment should be cleaned up
-        fragments = Dir.glob("#{cache_dir}/types/Query_*.sdl")
+        # Old fragment should be cleaned up (both schemas are anonymous → same effective subdir)
+        eff = effective_dir(schema_v2, cache_dir)
+        fragments = Dir.glob("#{eff}/types/Query_*.sdl")
         assert_equal 1, fragments.length
       end
     end
@@ -539,7 +550,6 @@ describe GraphQL::Schema::CachedDump do
     it "removes old full schema files during GC" do
       Dir.mktmpdir do |dir|
         cache_dir = File.join(dir, "cache")
-        FileUtils.mkdir_p(File.join(cache_dir, "types"))
 
         watch_dir = File.join(dir, "src")
         FileUtils.mkdir_p(watch_dir)
@@ -550,6 +560,8 @@ describe GraphQL::Schema::CachedDump do
           field :field_0, String, null: true
         }
         schema = Class.new(GraphQL::Schema) { query q }
+        eff = effective_dir(schema, cache_dir)
+        FileUtils.mkdir_p(File.join(eff, "types"))
 
         fp_cache.clear
         GraphQL::Schema::CachedDump.dump(schema, cache_dir: cache_dir, watch_dirs: [watch_dir])
@@ -557,10 +569,10 @@ describe GraphQL::Schema::CachedDump do
         # Manually create 5 old schema files to verify GC removes them
         5.times do |i|
           sleep 0.01
-          File.write(File.join(cache_dir, "schema_#{'0' * 64}#{i}.graphql"), "old#{i}")
+          File.write(File.join(eff, "schema_#{'0' * 64}#{i}.graphql"), "old#{i}")
         end
 
-        before_count = Dir.glob("#{cache_dir}/schema_*").length
+        before_count = Dir.glob("#{eff}/schema_*.graphql").length
         assert before_count > 2
 
         # Trigger a file change to invoke GC
@@ -570,7 +582,7 @@ describe GraphQL::Schema::CachedDump do
 
         # GC runs before the new schema file is written, so it trims to 2,
         # then dump writes the new file (total 3 at most).
-        after_count = Dir.glob("#{cache_dir}/schema_*").length
+        after_count = Dir.glob("#{eff}/schema_*.graphql").length
         assert after_count < before_count, "GC should have removed some schema files (before=#{before_count}, after=#{after_count})"
         assert after_count <= 3, "Expected at most 3 schema files after GC + new write, got #{after_count}"
       end
@@ -655,7 +667,7 @@ describe GraphQL::Schema::CachedDump do
 
         GraphQL::Schema::CachedDump.dump(schema, cache_dir: new_dir)
         assert File.directory?(new_dir)
-        assert_equal 1, Dir.glob("#{new_dir}/*.graphql").length
+        assert_equal 1, Dir.glob("#{effective_dir(schema, new_dir)}/*.graphql").length
       end
     end
 
